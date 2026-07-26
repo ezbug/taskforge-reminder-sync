@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>TaskForge 提醒同步</string>
+    <key>CFBundleExecutable</key>
+    <string>TaskForgeReminderSync</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.codex.taskforge-reminder-sync</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>TaskForgeReminderSync</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>在“TaskForge 今日”列表中创建、更新任务，并读取完成状态以反向完成 TaskForge 源任务。</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>在“TaskForge 今日”列表中创建、更新任务，并读取完成状态以反向完成 TaskForge 源任务。</string>
+</dict>
+</plist>

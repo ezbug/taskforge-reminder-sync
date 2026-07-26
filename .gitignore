@@ -1,0 +1,15 @@
+.DS_Store
+.build/
+.swiftpm/
+dist/
+DerivedData/
+__pycache__/
+*.pyc
+*.xcuserstate
+*.log
+*.bin
+*.bak
+*.plist.local
+.env
+.env.*
+Backups/

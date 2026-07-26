@@ -1,0 +1,490 @@
+import Foundation
+import TaskForgeReminderCore
+
+private struct TestFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+private func require(
+    _ condition: Bool,
+    _ message: String
+) throws {
+    guard condition else {
+        throw TestFailure(description: message)
+    }
+}
+
+private func requireValue<T>(
+    _ value: T?,
+    _ message: String
+) throws -> T {
+    guard let value else {
+        throw TestFailure(description: message)
+    }
+    return value
+}
+
+private var shanghaiCalendar: Calendar {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+    return calendar
+}
+
+private typealias TestCase = (name: String, body: () throws -> Void)
+
+private indirect enum FixtureValue {
+    case null
+    case bool(Bool)
+    case int(Int)
+    case string(String)
+    case array([FixtureValue])
+    case map([(FixtureValue, FixtureValue)])
+}
+
+private func encodeFixture(_ value: FixtureValue) -> Data {
+    var bytes: [UInt8] = []
+
+    func appendLength(_ value: Int, shortPrefix: UInt8, longPrefix: UInt8) {
+        if value < 16 {
+            bytes.append(shortPrefix | UInt8(value))
+        } else {
+            bytes.append(longPrefix)
+            bytes.append(UInt8((value >> 8) & 0xFF))
+            bytes.append(UInt8(value & 0xFF))
+        }
+    }
+
+    func append(_ value: FixtureValue) {
+        switch value {
+        case .null:
+            bytes.append(0xC0)
+        case let .bool(flag):
+            bytes.append(flag ? 0xC3 : 0xC2)
+        case let .int(number):
+            if (0...127).contains(number) {
+                bytes.append(UInt8(number))
+            } else {
+                bytes.append(0xCD)
+                bytes.append(UInt8((number >> 8) & 0xFF))
+                bytes.append(UInt8(number & 0xFF))
+            }
+        case let .string(string):
+            let utf8 = Array(string.utf8)
+            if utf8.count < 32 {
+                bytes.append(0xA0 | UInt8(utf8.count))
+            } else if utf8.count <= 255 {
+                bytes.append(0xD9)
+                bytes.append(UInt8(utf8.count))
+            } else {
+                bytes.append(0xDA)
+                bytes.append(UInt8((utf8.count >> 8) & 0xFF))
+                bytes.append(UInt8(utf8.count & 0xFF))
+            }
+            bytes.append(contentsOf: utf8)
+        case let .array(values):
+            appendLength(values.count, shortPrefix: 0x90, longPrefix: 0xDC)
+            values.forEach(append)
+        case let .map(entries):
+            appendLength(entries.count, shortPrefix: 0x80, longPrefix: 0xDE)
+            for (key, value) in entries {
+                append(key)
+                append(value)
+            }
+        }
+    }
+
+    append(value)
+    return Data(bytes)
+}
+
+private func taskDate(
+    _ year: Int,
+    _ month: Int,
+    _ day: Int,
+    hour: Int? = nil,
+    minute: Int? = nil
+) -> FixtureValue {
+    let time: FixtureValue
+    if let hour, let minute {
+        time = .array([.int(hour), .int(minute)])
+    } else {
+        time = .null
+    }
+    return .array([
+        .array([.int(year), .int(month), .int(day)]),
+        time,
+        .null,
+        .null,
+        .int(0),
+        .bool(false),
+        .bool(false)
+    ])
+}
+
+private func taskRecord(
+    id: String,
+    title: String,
+    status: String,
+    scheduled: FixtureValue,
+    sourceType: String = "markdownInline",
+    originalLine: String? = nil,
+    onCompletion: String = "keep",
+    recurrence: String? = nil
+) -> FixtureValue {
+    var fields = Array(repeating: FixtureValue.null, count: 33)
+    fields[0] = .string(id)
+    fields[1] = .string(title)
+    fields[3] = .array([.string(status), .null])
+    fields[4] = .string("none")
+    fields[12] = scheduled
+    fields[18] = .string("/vault/journal/2026-07-26.md")
+    fields[20] = .string(sourceType)
+    fields[25] = .string(onCompletion)
+    if let recurrence {
+        fields[30] = .string(recurrence)
+    }
+    fields[31] = .string(originalLine ?? "- [ ] \(title)")
+    fields[32] = .int(12)
+    return .array(fields)
+}
+
+private func taskStoreFixture() -> Data {
+    encodeFixture(
+        .array([
+            .int(6),
+            .map([]),
+            .int(1),
+            .string("/vault"),
+            .array([
+                taskRecord(
+                    id: "task-1",
+                    title: "示例任务",
+                    status: "todo",
+                    scheduled: taskDate(2026, 7, 26)
+                ),
+                taskRecord(
+                    id: "task-2",
+                    title: "带时间任务",
+                    status: "inProgress",
+                    scheduled: taskDate(2026, 7, 26, hour: 22, minute: 45)
+                ),
+                taskRecord(
+                    id: "task-3",
+                    title: "已经完成",
+                    status: "done",
+                    scheduled: taskDate(2026, 7, 26)
+                ),
+                taskRecord(
+                    id: "task-4",
+                    title: "明天任务",
+                    status: "todo",
+                    scheduled: taskDate(2026, 7, 27)
+                )
+            ])
+        ])
+    )
+}
+
+private let tests: [TestCase] = [
+    ("TaskForge v6 MessagePack store decodes task records", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        try require(snapshot.version == 6, "unexpected task store version")
+        try require(snapshot.vaultPath == "/vault", "unexpected vault path")
+        try require(snapshot.tasks.count == 4, "unexpected decoded task count")
+        try require(snapshot.tasks[0].title == "示例任务", "unexpected first task title")
+        try require(snapshot.tasks[0].sourceType == "markdownInline", "unexpected source type")
+    }),
+    ("today selection matches TaskForge calendar open tasks", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let today = TaskForgeDay(year: 2026, month: 7, day: 26)
+        let tasks = snapshot.openTasksScheduled(on: today)
+
+        try require(tasks.map(\.identifier) == ["task-1", "task-2"], "unexpected today tasks")
+        try require(tasks[0].scheduled?.time == nil, "untimed task should be all-day")
+        try require(tasks[1].scheduled?.time?.hour == 22, "unexpected scheduled hour")
+        try require(tasks[1].scheduled?.time?.minute == 45, "unexpected scheduled minute")
+    }),
+    ("TaskForge task marker is stable and hides raw identifiers", {
+        let first = TaskSyncMarker.make(vaultPath: "/vault", taskIdentifier: "task/raw")
+        let same = TaskSyncMarker.make(vaultPath: "/vault", taskIdentifier: "task/raw")
+        let other = TaskSyncMarker.make(vaultPath: "/vault", taskIdentifier: "task/other")
+
+        try require(first == same, "task marker should be stable")
+        try require(first != other, "different tasks need different markers")
+        try require(first.hasPrefix("TaskForge-Task-ID: "), "task marker prefix missing")
+        try require(!first.contains("task/raw"), "task marker should encode raw ID")
+    }),
+    ("TaskForge scheduled time maps to reminder due components", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let calendar = shanghaiCalendar
+        let untimed = try requireValue(snapshot.tasks[0].scheduled, "missing untimed schedule")
+        let timed = try requireValue(snapshot.tasks[1].scheduled, "missing timed schedule")
+        let untimedComponents = TaskReminderTiming.dueDateComponents(
+            for: untimed,
+            calendar: calendar
+        )
+        let timedComponents = TaskReminderTiming.dueDateComponents(
+            for: timed,
+            calendar: calendar
+        )
+
+        try require(untimedComponents.day == 26, "unexpected untimed day")
+        try require(untimedComponents.hour == nil, "untimed task should have no hour")
+        try require(timedComponents.hour == 22, "unexpected timed hour")
+        try require(timedComponents.minute == 45, "unexpected timed minute")
+    }),
+    ("reminder due comparison ignores EventKit calendar metadata", {
+        let scheduled = TaskForgeScheduledDate(
+            day: TaskForgeDay(year: 2026, month: 7, day: 27),
+            time: TaskForgeTime(hour: 11, minute: 30)
+        )
+        let desired = TaskReminderTiming.dueDateComponents(
+            for: scheduled,
+            calendar: shanghaiCalendar
+        )
+        var stored = DateComponents()
+        stored.year = 2026
+        stored.month = 7
+        stored.day = 27
+        stored.hour = 11
+        stored.minute = 30
+
+        try require(
+            ReminderDueDatePolicy.isEquivalent(stored, desired),
+            "EventKit metadata differences must not trigger a write"
+        )
+        stored.minute = 31
+        try require(
+            !ReminderDueDatePolicy.isEquivalent(stored, desired),
+            "a real minute change must trigger a write"
+        )
+    }),
+    ("task marker decodes to its vault and task identifier", {
+        let marker = TaskSyncMarker.make(
+            vaultPath: "/vault/中文",
+            taskIdentifier: "task-42"
+        )
+        let decoded = try requireValue(
+            TaskSyncMarker.decode(marker),
+            "marker should decode"
+        )
+
+        try require(decoded.vaultPath == "/vault/中文", "unexpected decoded vault")
+        try require(decoded.taskIdentifier == "task-42", "unexpected decoded task ID")
+    }),
+    ("inline completion checks the exact source task and adds completion date", {
+        let task = TaskForgeTask(
+            identifier: "task-inline",
+            title: "示例任务",
+            status: "todo",
+            priority: nil,
+            scheduled: TaskForgeScheduledDate(
+                day: TaskForgeDay(year: 2026, month: 7, day: 26),
+                time: nil
+            ),
+            filePath: "/vault/journal/2026-07-26.md",
+            sourceType: "markdownInline",
+            originalLine: "\t- [ ] 示例任务",
+            lineNumber: 2,
+            onCompletion: "keep",
+            recurrence: nil
+        )
+        let source = "heading\n\t- [ ] 示例任务\nnext\n"
+        let edit = try TaskCompletionEditor.complete(
+            task: task,
+            contents: source,
+            on: TaskForgeDay(year: 2026, month: 7, day: 26)
+        )
+
+        try require(edit.lineNumber == 2, "unexpected edited line")
+        try require(
+            edit.updatedContents == "heading\n\t- [x] 示例任务 ✅ 2026-07-26\nnext\n",
+            "unexpected inline completion edit"
+        )
+    }),
+    ("TaskNotes completion updates status and completedDate", {
+        let task = TaskForgeTask(
+            identifier: "task-note",
+            title: "任务笔记",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/TaskNotes/Tasks/任务笔记.md",
+            sourceType: "taskNotes",
+            originalLine: "tasknotes:{}",
+            lineNumber: 1,
+            onCompletion: "keep",
+            recurrence: nil
+        )
+        let source = """
+        ---
+        status: open
+        priority: medium
+        completedDate: 2026-07-20
+        ---
+        body
+        """
+        let edit = try TaskCompletionEditor.complete(
+            task: task,
+            contents: source,
+            on: TaskForgeDay(year: 2026, month: 7, day: 26)
+        )
+
+        try require(edit.updatedContents.contains("status: done"), "status not updated")
+        try require(
+            edit.updatedContents.contains("completedDate: 2026-07-26"),
+            "completion date not updated"
+        )
+        try require(
+            !edit.updatedContents.contains("completedDate: 2026-07-20"),
+            "old completion date remains"
+        )
+    }),
+    ("completion refuses recurring tasks", {
+        let task = TaskForgeTask(
+            identifier: "recurring",
+            title: "每天任务",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/daily.md",
+            sourceType: "markdownInline",
+            originalLine: "- [ ] 每天任务",
+            lineNumber: 1,
+            onCompletion: "keep",
+            recurrence: "every day"
+        )
+        do {
+            _ = try TaskCompletionEditor.complete(
+                task: task,
+                contents: "- [ ] 每天任务\n",
+                on: TaskForgeDay(year: 2026, month: 7, day: 26)
+            )
+            throw TestFailure(description: "recurring task should be refused")
+        } catch let error as TaskCompletionEditorError {
+            try require(error == .recurringTaskUnsupported, "unexpected refusal reason")
+        }
+    }),
+    ("completion refuses stale or ambiguous inline source", {
+        let task = TaskForgeTask(
+            identifier: "stale",
+            title: "同名任务",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/tasks.md",
+            sourceType: "markdownInline",
+            originalLine: "- [ ] 同名任务",
+            lineNumber: 2,
+            onCompletion: "keep",
+            recurrence: nil
+        )
+        do {
+            _ = try TaskCompletionEditor.complete(
+                task: task,
+                contents: "- [ ] 同名任务\nchanged\n- [ ] 同名任务\n",
+                on: TaskForgeDay(year: 2026, month: 7, day: 26)
+            )
+            throw TestFailure(description: "ambiguous source should be refused")
+        } catch let error as TaskCompletionEditorError {
+            try require(error == .sourceLineNotUnique, "unexpected stale-source reason")
+        }
+    }),
+    ("forward completion policy never reopens an Apple-completed reminder", {
+        try require(
+            ReminderCompletionPolicy.desiredCompletion(
+                taskIsCompleted: false,
+                reminderIsCompleted: true
+            ),
+            "Apple-completed reminder must stay completed"
+        )
+        try require(
+            ReminderCompletionPolicy.desiredCompletion(
+                taskIsCompleted: true,
+                reminderIsCompleted: false
+            ),
+            "TaskForge-completed task must complete reminder"
+        )
+    }),
+    ("readback accepts a completed inline task disappearing from refreshed cache", {
+        let initial = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let original = initial.tasks[0]
+        let refreshed = TaskForgeSnapshot(
+            version: initial.version,
+            vaultPath: initial.vaultPath,
+            tasks: initial.tasks.filter { $0.identifier != original.identifier }
+        )
+
+        try require(
+            TaskCompletionReadback.confirmsCompletion(
+                of: original,
+                in: refreshed.tasks
+            ),
+            "a removed inline task should confirm completion"
+        )
+        try require(
+            !TaskCompletionReadback.confirmsCompletion(
+                of: original,
+                in: initial.tasks
+            ),
+            "an unchanged open task must not confirm completion"
+        )
+    }),
+    ("reminder source reference round-trips after TaskForge cache eviction", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let original = snapshot.tasks[0]
+        let reference = TaskSourceReference(task: original)
+        let notes = "来源：TaskForge\n\(reference.encodedLine)"
+        let decoded = try requireValue(
+            TaskSourceReference.decode(from: notes),
+            "source reference should decode"
+        )
+
+        try require(decoded == reference, "source reference changed during round-trip")
+        let resolved = try requireValue(
+            TaskSourceReference.resolveTask(
+                markerTaskIdentifier: original.identifier,
+                snapshotTasks: [],
+                reminderNotes: notes
+            ),
+            "evicted task should resolve from reminder metadata"
+        )
+        try require(resolved == original, "resolved historical task differs from source")
+    }),
+    ("completed source inspector skips an already completed historical task", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let task = snapshot.tasks[0]
+        let source = (
+            Array(repeating: "filler", count: 11)
+                + ["- [x] 示例任务 ✅ 2026-07-26"]
+        ).joined(separator: "\n")
+
+        try require(
+            TaskCompletionSourceInspector.isCompleted(
+                task: task,
+                contents: source
+            ),
+            "completed historical source should be recognized"
+        )
+    })
+]
+
+@main
+private struct TestRunner {
+    static func main() {
+        var failures = 0
+        for test in tests {
+            do {
+                try test.body()
+                print("PASS  \(test.name)")
+            } catch {
+                failures += 1
+                print("FAIL  \(test.name): \(error)")
+            }
+        }
+        print("\n\(tests.count - failures)/\(tests.count) tests passed")
+        if failures > 0 {
+            exit(1)
+        }
+    }
+}
