@@ -113,8 +113,10 @@ macOS 会请求“提醒事项”访问权限。工具不需要“日历”权�
 定向预览或完成一个任务：
 
 ```bash
-TaskForgeReminderSync --reverse-dry-run --task-id TASK_ID
-TaskForgeReminderSync --reverse-once --task-id TASK_ID
+./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
+  --reverse-dry-run --task-id TASK_ID
+./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
+  --reverse-once --task-id TASK_ID
 ```
 
 ## 同步与安全规则
