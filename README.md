@@ -20,6 +20,9 @@
 - **歧义时不新建**：同一 ID 或源位置对应多个提醒时，记录冲突并停止该任务，不会继续制造重复项。
 - **持久源映射**：提醒中保存经过 Base64 编码的任务源引用。任务离开 TaskForge 当前缓存后，历史提醒仍能定位原笔记。
 - **防止误重开**：任意一端已经完成时，正向同步不会把 Apple 提醒重新打开。
+- **可恢复自动清理**：只在配置的提醒列表中，把“未完成、不重要、且 TaskForge 当前缓存和持久源都确认不存在”的提醒经过至少相隔 60 秒的两次扫描后删除。
+- **重要提醒保护**：Apple 内建优先级大于零，或标题去除开头空白后以 `!`、`！`、`❗`、`‼️`、`⭐`、`📌` 开头的提醒永不进入清理候选。
+- **删除前本机备份**：每批清理先写入并回读校验权限为 `0600` 的备份；最近一个尚未恢复的批次可以一键恢复。
 - **先备份再回写**：每次反向修改前保存源文件副本，并记录修改前后的 SHA-256。
 - **保守拒绝**：重复任务、非 `keep` 完成策略、Vault 外路径、陈旧或歧义源行都不会被自动修改。
 - **不删除源任务**：
@@ -34,12 +37,8 @@ TaskForge tasks.v6.bin
         │ 读取今日未完成任务
         ▼
 Apple 提醒事项 / TaskForge 今日
-        │ 完成状态 + 持久源引用
-        ▼
-Vault Markdown / TaskNotes
-        │ TaskForge 重新索引
-        ▼
-TaskForge done
+        ├─ 完成状态 + 持久源引用 ─▶ Vault Markdown / TaskNotes ─▶ TaskForge done
+        └─ 双源确认不存在 ─▶ 两次扫描 ─▶ 本机备份 ─▶ 删除 Apple 提醒
 ```
 
 正向同步只**新建今天的任务**，避免把整个 Vault 导入提醒事项；已经关联的任务即使改到其他日期，仍会更新原提醒。反向同步则会检查所有已经建立关联的提醒，因此昨天或更早的任务在 Apple 端完成后仍可闭环。
@@ -117,6 +116,13 @@ macOS 会请求“提醒事项”访问权限。工具不需要“日历”权�
 - 标准日志：`~/Library/Logs/TaskForgeReminderSync.log`
 - 错误日志：`~/Library/Logs/TaskForgeReminderSync.error.log`
 - 回写备份：`~/Library/Application Support/TaskForgeReminderSync/Backups/`
+- 清理候选账本：`~/Library/Application Support/TaskForgeReminderSync/PruneCandidates.json`
+- 清理备份：`~/Library/Application Support/TaskForgeReminderSync/PruneBackups/`
+- 清理日志匿名化盐：`~/Library/Application Support/TaskForgeReminderSync/PruneHashSalt`
+
+候选账本、清理备份和匿名化盐均为本机私有运行数据，文件权限为 `0600`
+（父目录为 `0700`），不会进入 Git 仓库。备份可能包含恢复提醒所需的标题、
+笔记、日期、闹钟、重复规则和原始系统标识，请像保护 Vault 一样保护该目录。
 
 ## 命令
 
@@ -129,8 +135,11 @@ macOS 会请求“提醒事项”访问权限。工具不需要“日历”权�
 | `--deduplicate` | 保留权威提醒，把冗余活跃提醒移到可恢复的归档列表 | 是 |
 | `--reverse-dry-run` | 预览 Apple → TaskForge 的源文件修改 | 否 |
 | `--reverse-once` | 执行一次反向完成并等待 TaskForge 回读 | 是 |
-| `--sync` | 先反向扫描，再执行一次今日任务正向同步 | 是 |
-| `--watch` | 常驻近实时双向同步 | 是 |
+| `--prune-dry-run` | 严格只读分类，报告首次候选和已满足二次确认的数量；不写账本、备份或盐，不修改提醒 | 否 |
+| `--prune-once` | 推进一次候选状态；首次登记，至少 60 秒后的下一次扫描才可能备份并删除 | 是 |
+| `--restore-last-prune` | 恢复最近一个尚未恢复的实际删除批次 | 是 |
+| `--sync` | 依次反向扫描、正向同步并推进一次自动清理 | 是 |
+| `--watch` | 常驻近实时双向同步，并在每轮末推进自动清理 | 是 |
 
 常用参数：
 
@@ -151,6 +160,58 @@ macOS 会请求“提醒事项”访问权限。工具不需要“日历”权�
   --reverse-once --task-id TASK_ID
 ```
 
+## 自动清理与恢复
+
+清理候选必须同时满足全部条件：
+
+1. 位于 `--list-name` 指定的列表（默认 `TaskForge 今日`）；
+2. 尚未完成；
+3. EventKit 优先级为零，且标题没有六个受保护前缀；
+4. 当前 TaskForge 快照没有对应任务；
+5. 持久源引用也无法在 Vault 中确认任务存在。
+
+第 4、5 项是“双源不存在”检查。源文件不可读、引用越出 Vault、源行同名或
+位置有歧义、TaskForge 快照解码失败、权限或 I/O 出错时，结果属于“无法判定”
+而不是“不存在”，清理会失败关闭并保留提醒。旧版提醒若既不在当前缓存中，
+也没有可验证的持久源引用，则可能成为候选。
+
+清理只向 EventKit 请求目标列表中的提醒；其他 Apple 提醒列表、去重归档列表
+和已完成历史都不参与清理。同名目标列表若出现多个匹配，工具会拒绝猜测并
+整轮停止。目标列表不存在时，清理返回零，不会为了清理新建列表。
+
+先运行严格只读预演：
+
+```bash
+./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
+  --prune-dry-run
+```
+
+真实推进需要两次独立扫描，且两次至少相隔 60 秒：
+
+```bash
+./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
+  --prune-once
+# 至少 60 秒后，由 watcher / --sync / 第二次 --prune-once 再确认
+./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
+  --prune-once
+```
+
+期间只要提醒被完成、加入优先级或重要前缀、恢复 TaskForge 身份、移出目标
+列表或候选属性改变，旧候选就会撤销；属性改变后仍符合条件也要重新计时。
+删除前必须成功写入并校验整批备份，否则整批不删除。
+
+恢复最近一个尚未恢复的删除批次：
+
+```bash
+./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
+  --restore-last-prune
+```
+
+恢复会重建用户可编辑字段，但 EventKit 会生成新的系统 ID。恢复项享有至少
+24 小时的本机清理宽限；宽限结束后仍符合条件，也必须重新经历两次扫描。
+如果原列表已经不存在，恢复只会尝试在备份记录的原提醒事项账户中重建；账户
+缺失或同一账户中有多个同名列表时失败关闭，备份保持未消费。
+
 ## 同步与安全规则
 
 1. 提醒必须带有本工具生成的稳定标记，才会参与反向同步。
@@ -161,8 +222,9 @@ macOS 会请求“提醒事项”访问权限。工具不需要“日历”权�
 6. 写入后逐字节校验文件，并等待 TaskForge 任务库刷新。
 7. TaskForge 可能从缓存中移除已完成的内联任务；这不等于源任务被删除。
 8. 早期版本创建、没有持久源引用且已经离开 TaskForge 缓存的提醒会被安全跳过，不会猜测写入。
-9. TaskForge 删除任务时，本工具不会自动删除对应提醒；删除属于显式的非自动操作。
-10. 去重维护只移动冗余提醒到独立归档列表，不删除提醒或 TaskForge 源任务。
+9. 自动清理只删除符合上述五项条件并通过双扫描确认的 Apple 提醒；不会删除或移动 TaskForge 源任务。
+10. Apple → TaskForge 反向同步仍只把源任务改为 `done`，绝不会因清理删除任务行或 TaskNotes 文件。
+11. 去重维护只移动冗余提醒到独立归档列表，不删除提醒或 TaskForge 源任务；去重归档列表也不在自动清理范围内。
 
 只读检查整个受管列表是否仍然无重复：
 
@@ -171,6 +233,11 @@ macOS 会请求“提醒事项”访问权限。工具不需要“日历”权�
 ```
 
 审计覆盖当前与历史受管提醒，只输出数量，不输出标题、笔记、Vault 路径或原始任务 ID。“历史源位置复用”是信息项：同一行在不同计划日期承载过不同任务，不等同于重复。
+
+清理日志也只输出首次候选、等待、撤销、删除、恢复和失败的数量，必要的单项
+关联使用本机随机盐生成的截断哈希。清理日志不会输出标题、笔记、Vault /
+源文件路径、原始 TaskForge ID 或原始 EventKit ID。EventKit 读取若 30 秒
+未完成，会取消该次请求并以匿名错误失败关闭，不会继续删除。
 
 修复早期版本已经产生的活跃重复项：
 
@@ -203,7 +270,12 @@ launchctl print "gui/$(id -u)/local.codex.taskforge-reminder-sync"
 
 - Apple 提醒事项中已经创建的内容；
 - Vault 中的任何笔记或任务；
-- 反向写入备份。
+- 反向写入备份；
+- 清理候选账本、清理备份、匿名化盐和运行日志。
+
+如果需要找回已清理提醒，请在删除这些本机运行数据前执行
+`--restore-last-prune`。App 已卸载时，可以重新构建后从 `dist` 运行恢复命令；
+备份被恢复后仍会保留，并记录为已恢复。
 
 ## 开发与测试
 
@@ -213,14 +285,17 @@ swift build
 ./scripts/build-app.sh
 ```
 
-测试覆盖 MessagePack v6 解码、今日任务筛选、稳定标记、ID 变化后的源位置复用、歧义去重、日期语义比较、正反向完成策略、历史源引用、Markdown / TaskNotes 回写和安全拒绝条件。
+测试覆盖 MessagePack v6 解码、今日任务筛选、稳定标记、ID 变化后的源位置
+复用、歧义去重、日期语义比较、正反向完成策略、历史源引用、Markdown /
+TaskNotes 回写、清理判定、双扫描状态机、私有备份、恢复宽限、EventKit
+跨列表隔离以及读取超时取消。
 
 ## 限制
 
 - TaskForge 改变内部缓存格式后，解码器可能需要更新。
 - 同时改动内联任务的文件位置、行号和标题，且 TaskForge 也更换内部 ID 时，没有足够的稳定信息可安全认定为同一任务；工具宁可拒绝猜测。
 - 当前不会反向处理重复任务或完成后会移动、归档、删除的任务。
-- 当前不会根据 TaskForge 删除操作自动删除 Apple 提醒事项。
+- 自动清理判断的是“当前缓存与真实源都确认不存在”，不会仅凭 TaskForge 缓存暂时缺席就删除 Apple 提醒；已完成、重要或其他列表中的提醒不清理。
 - TaskForge 未运行时，源文件可能不会立即被重新索引；建议让 TaskForge 保持运行。
 - 本项目不提供云服务、遥测或跨设备同步；Apple 提醒事项自身的 iCloud 同步由系统负责。
 
