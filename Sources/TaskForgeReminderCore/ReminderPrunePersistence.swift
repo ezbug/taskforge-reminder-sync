@@ -353,7 +353,15 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             (url, try loadBackup(at: url))
         }
         return batches
-            .filter { $0.1.restoredAt == nil }
+            .filter {
+                guard
+                    $0.1.restoredAt == nil,
+                    let deletedItems = $0.1.actuallyDeletedItems
+                else {
+                    return false
+                }
+                return !deletedItems.isEmpty
+            }
             .sorted {
                 if $0.1.createdAt == $1.1.createdAt {
                     return $0.0.lastPathComponent > $1.0.lastPathComponent
@@ -365,7 +373,10 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
 
     public func markRestored(at url: URL, date: Date) throws {
         var batch = try loadBackup(at: url)
-        guard batch.actuallyDeletedIdentifiers != nil else {
+        guard
+            let deletedItems = batch.actuallyDeletedItems,
+            !deletedItems.isEmpty
+        else {
             throw ReminderPruneStoreError.invalidBackup
         }
         batch.restoredAt = date
@@ -396,7 +407,10 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         at url: URL
     ) throws -> ReminderPruneBackupBatch {
         var batch = try loadBackup(at: url)
-        guard batch.actuallyDeletedIdentifiers != nil else {
+        guard
+            let deletedItems = batch.actuallyDeletedItems,
+            !deletedItems.isEmpty
+        else {
             throw ReminderPruneStoreError.invalidBackup
         }
         if batch.restoreAttemptIdentifier == nil {
@@ -414,6 +428,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         guard
             batch.restoreAttemptIdentifier != nil,
             let deleted = batch.actuallyDeletedIdentifiers,
+            !deleted.isEmpty,
             Set(identifiers.keys) == Set(deleted),
             identifiers.values.allSatisfy({ !$0.isEmpty }),
             Set(identifiers.values).count == identifiers.count

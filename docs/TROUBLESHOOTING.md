@@ -134,10 +134,12 @@ Run:
   --restore-last-prune
 ```
 
-The command restores the newest verified batch that has an actual deletion
-result and has not already been restored. It restores user-editable fields,
-but macOS assigns new EventKit IDs. Restored reminders receive a 24-hour
-minimum grace period and must complete two new scans before any later deletion.
+The command restores the newest verified, un-restored batch whose parsed actual
+deletion result is non-empty. Newer unresolved or zero-deletion backups remain
+available for audit but do not block an older real deletion batch and are not
+marked restored. It restores user-editable fields, but macOS assigns new
+EventKit IDs. Restored reminders receive a 24-hour minimum grace period and
+must complete two new scans before any later deletion.
 
 If the original list is gone, the tool attempts to recreate it only in the
 original reminders account recorded by the backup. A missing account, multiple
@@ -146,7 +148,8 @@ post-restore readback fails closed; the backup remains available for retry.
 The command is idempotent after an interrupted restore and will not knowingly
 duplicate an already read-back restored item.
 
-If no unrestored batch is found, the restored count is zero. Backups remain at:
+If no eligible non-empty unrestored batch is found, the restored count is zero.
+Unresolved, empty and restored backups remain at:
 
 `~/Library/Application Support/TaskForgeReminderSync/PruneBackups/`
 

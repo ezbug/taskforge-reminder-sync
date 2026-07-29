@@ -1463,6 +1463,7 @@ git commit -m "test(EventKit): 验证清理隔离和恢复闭环"
 PruneCandidates.json
 PruneBackups/
 PruneHashSalt
+PruneHashSalt.lock
 *.prune-test.json
 ```
 
@@ -1471,10 +1472,18 @@ PruneHashSalt
 - [ ] **步骤 3：执行文档矛盾和隐私扫描**
 
 ```bash
+public_docs=(
+  README.md
+  docs/ARCHITECTURE.md
+  docs/TROUBLESHOOTING.md
+  PRIVACY.md
+  SECURITY.md
+  CHANGELOG.md
+)
 rg -n "不会.*删除|不自动删除|其他.*列表|prune|清理|恢复" \
-  README.md docs PRIVACY.md SECURITY.md CHANGELOG.md
-rg -n "/Users/[^/]+/|/var/folders/|TaskForge-Task-ID: [A-Za-z0-9+/=]{16,}" \
-  README.md docs PRIVACY.md SECURITY.md CHANGELOG.md
+  "${public_docs[@]}"
+rg -n "[/]Users/[^/]+/|[/]var/folders/|TaskForge-Task-ID: [A-Za-z0-9+/=]{16,}" \
+  "${public_docs[@]}"
 git diff --check
 ```
 
@@ -1575,8 +1584,8 @@ tail -80 "$HOME/Library/Logs/TaskForgeReminderSync.error.log"
 git status --short --branch
 git diff origin/main...HEAD --check
 git diff origin/main...HEAD --name-only
-git diff origin/main...HEAD -- | \
-  rg -n '(/Users/[^/]+/|/var/folders/|TaskForge-Task-ID: [A-Za-z0-9+/=]{16,})'
+git diff origin/main...HEAD -- . ':(exclude)docs/superpowers/**' | \
+  rg -n '([/]Users/[^/]+/|[/]var/folders/|TaskForge-Task-ID: [A-Za-z0-9+/=]{16,})'
 ```
 
 预期：

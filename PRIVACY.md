@@ -8,12 +8,20 @@ TaskForge Reminder Sync is designed to run entirely on the local Mac.
 - titles, schedules, status and source metadata for TaskForge tasks;
 - reminders in the configured Apple Reminders list only; pruning does not fetch
   reminder contents from any other list;
-- Markdown or TaskNotes source files only when a linked reminder is completed.
+- the matching Markdown or TaskNotes source file when reverse-completing a
+  linked reminder;
+- for pruning classification of an unfinished reminder, only the Vault file
+  named by that reminder's durable source reference, to confirm whether the
+  source task still exists.
 
 ## Data it writes
 
 - linked reminders in the configured Apple Reminders list;
-- completion markers in the matching Vault source task;
+- completion state in the matching Vault source task during reverse completion;
+- automatic deletion of target-list reminders only after they satisfy every
+  prune-candidate rule and pass the two-scan confirmation;
+- restored reminders rebuilt under the original reminders source and list
+  semantics recorded by the verified backup;
 - timestamped source-file backups under
   `~/Library/Application Support/TaskForgeReminderSync/Backups/`;
 - the `0600` pruning candidate ledger at
@@ -79,8 +87,9 @@ location access.
 Generated build directories, TaskForge cache files, logs, backups, `.env`
 files and local plist overrides are excluded by `.gitignore`. Contributors
 should still inspect staged files before every push. `PruneCandidates.json`,
-`PruneBackups/`, `PruneHashSalt` and `*.prune-test.json` are explicitly ignored
-in case private debugging data is copied into a checkout.
+`PruneBackups/`, `PruneHashSalt`, `PruneHashSalt.lock` and
+`*.prune-test.json` are explicitly ignored in case private debugging data is
+copied into a checkout.
 
 Never commit reminder titles, notes, Vault or source paths, raw TaskForge /
 EventKit identifiers, candidate ledgers, pruning backups, salts or production

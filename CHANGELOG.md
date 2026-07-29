@@ -12,6 +12,8 @@ All notable changes to this project are documented here.
   private candidate persistence and fail-closed source resolution.
 - Added checksummed `0600` pre-deletion backups and
   `--restore-last-prune` with a minimum 24-hour restoration grace period.
+- Restore selection skips unresolved, zero-deletion and already restored
+  backups, choosing the newest remaining real deletion batch.
 - Added strict read-only `--prune-dry-run` and one-pass `--prune-once`
   commands; `--sync` and `--watch` now advance the same pruning state machine
   after reverse and forward synchronization.

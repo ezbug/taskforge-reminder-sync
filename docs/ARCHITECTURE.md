@@ -4,7 +4,10 @@
 
 ### TaskForgeReminderCore
 
-A Foundation-only library responsible for:
+The core library keeps EventKit out of policy and persistence code. Its pure
+task, matching and pruning policy uses Foundation value types; private pruning
+persistence additionally uses CryptoKit for checksums and hashing, plus Darwin
+for POSIX permissions and file locking. The library is responsible for:
 
 - decoding TaskForge MessagePack v6 records;
 - selecting scheduled open tasks;
@@ -16,7 +19,8 @@ A Foundation-only library responsible for:
 - comparing reminder dates semantically;
 - validating and editing Markdown / TaskNotes completion state.
 
-Keeping these rules outside EventKit makes them deterministic and testable.
+Keeping these boundaries outside EventKit makes policy deterministic and local
+persistence independently testable.
 
 ### TaskForgeReminderSync
 
@@ -145,10 +149,13 @@ categories, never reminder content, source paths or raw identifiers.
 
 ## Restore flow
 
-`--restore-last-prune` selects the newest backup with a verified, recorded
-actual deletion result that has not been restored. It restores only items
-confirmed deleted, preserving EventKit-readable user fields. EventKit assigns
-new system IDs.
+`--restore-last-prune` selects by creation time the newest un-restored backup
+whose actual-deletion identifiers have been parsed and are non-empty. A newer
+backup with an unresolved result or an empty actual-deletion set remains on
+disk but cannot block an older real deletion batch and cannot be marked
+restored. Among multiple eligible batches, the newest wins; already restored
+batches are skipped. Restoration preserves EventKit-readable user fields, and
+EventKit assigns new system IDs.
 
 The original calendar is matched by calendar and source identifiers first. If
 it no longer exists, restoration may recreate it only in the recorded original

@@ -46,7 +46,10 @@ Reminder pruning adds these fixed boundaries:
   ambiguous restore errors preserve data and fail closed;
 - `--prune-dry-run` never writes the ledger, backups, salt or reminders;
 - TaskForge reverse completion only changes a task to `done`; pruning never
-  deletes or moves a TaskForge source task.
+  deletes or moves a TaskForge source task;
+- restoration skips unresolved, zero-deletion and already restored backups,
+  selecting the newest remaining verified batch with a non-empty actual
+  deletion result.
 
 EventKit target-list reads time out after 30 seconds and cancel the outstanding
 request. Pruning logs use aggregate counts, anonymous error categories and
