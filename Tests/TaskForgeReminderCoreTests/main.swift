@@ -46,6 +46,62 @@ private final class AsyncTestResultBox<Value>: @unchecked Sendable {
     private var result: Result<Value, Error>?
 }
 
+private final class LockedCounter: @unchecked Sendable {
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    func read() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    private let lock = NSLock()
+    private var count = 0
+}
+
+private final class LockedValues<Value: Sendable>: @unchecked Sendable {
+    func append(_ value: Value) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    func read() -> [Value] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+
+    private let lock = NSLock()
+    private var values: [Value] = []
+}
+
+private final class ScheduledCallbackBox: @unchecked Sendable {
+    func store(_ callback: @escaping @Sendable () -> Void) {
+        lock.lock()
+        self.callback = callback
+        lock.unlock()
+    }
+
+    func call() throws {
+        lock.lock()
+        let callback = self.callback
+        lock.unlock()
+        try require(
+            callback != nil,
+            "scheduled callback was not registered"
+        )
+        callback?()
+    }
+
+    private let lock = NSLock()
+    private var callback: (@Sendable () -> Void)?
+}
+
 private func waitForAsync<Value>(
     _ operation: @escaping @Sendable () async throws -> Value
 ) throws -> Value {
@@ -325,16 +381,26 @@ private func taskForgeEntries(at url: URL) throws -> [String] {
 }
 
 private let tests: [TestCase] = [
-    ("reminder fetch timeout resolves once and ignores a late callback", {
+    ("reminder fetch timeout cancels a registered request exactly once", {
+        let cancellations = LockedValues<Int>()
         do {
             let _: Int = try waitForAsync {
                 try await ReminderFetchWaiter.wait(
-                    timeout: 0,
+                    timeout: 0.05,
                     scheduleTimeout: { _, timeout in
-                        timeout()
+                        DispatchQueue.global().asyncAfter(
+                            deadline: .now() + 0.05
+                        ) {
+                            timeout()
+                            timeout()
+                        }
+                    },
+                    cancel: { identifier in
+                        cancellations.append(identifier)
                     },
                     start: { completion in
-                        completion(.success(7))
+                        _ = completion
+                        return 11
                     }
                 )
             }
@@ -342,8 +408,67 @@ private let tests: [TestCase] = [
                 description: "fetch timeout unexpectedly succeeded"
             )
         } catch ReminderPrunerError.reminderFetchFailed {
-            // Expected anonymous timeout after the late callback is ignored.
+            // Expected anonymous timeout.
         }
+        try require(
+            cancellations.read() == [11],
+            "timeout must cancel the registered request identifier once"
+        )
+    }),
+    ("reminder fetch success ignores a late timeout without cancelling", {
+        let scheduledTimeout = ScheduledCallbackBox()
+        let cancellations = LockedCounter()
+        let value: Int = try waitForAsync {
+            try await ReminderFetchWaiter.wait(
+                scheduleTimeout: { _, timeout in
+                    scheduledTimeout.store(timeout)
+                },
+                cancel: { _ in
+                    cancellations.increment()
+                },
+                start: { completion in
+                    completion(.success(7))
+                    return 12
+                }
+            )
+        }
+        try scheduledTimeout.call()
+        try scheduledTimeout.call()
+        try require(value == 7, "fetch success returned an unexpected value")
+        try require(
+            cancellations.read() == 0,
+            "a late timeout must not cancel a successful request"
+        )
+    }),
+    ("reminder fetch timeout before handle registration cancels once", {
+        let cancellations = LockedValues<Int>()
+        do {
+            let _: Int = try waitForAsync {
+                try await ReminderFetchWaiter.wait(
+                    timeout: 0,
+                    scheduleTimeout: { _, timeout in
+                        timeout()
+                        timeout()
+                    },
+                    cancel: { identifier in
+                        cancellations.append(identifier)
+                    },
+                    start: { completion in
+                        completion(.success(9))
+                        return 13
+                    }
+                )
+            }
+            throw TestFailure(
+                description: "pre-registration timeout unexpectedly succeeded"
+            )
+        } catch ReminderPrunerError.reminderFetchFailed {
+            // Expected; the callback arrives after timeout has already won.
+        }
+        try require(
+            cancellations.read() == [13],
+            "a late request identifier must be cancelled exactly once"
+        )
     }),
     ("reminder backup adapter round-trips every expressible field", {
         let eventStore = EKEventStore()
@@ -498,6 +623,62 @@ private let tests: [TestCase] = [
                 && captured.recurrenceRules.first?.setPositions
                     == [1, -1],
             "adapter fixture did not cover extended fields"
+        )
+    }),
+    ("reminder backup adapter round-trips recurrence end date", {
+        let eventStore = EKEventStore()
+        let original = EKReminder(eventStore: eventStore)
+        original.title = "adapter end-date fixture"
+        original.addRecurrenceRule(
+            EKRecurrenceRule(
+                recurrenceWith: .daily,
+                interval: 3,
+                end: EKRecurrenceEnd(
+                    end: Date(timeIntervalSince1970: 2_100_000_000)
+                )
+            )
+        )
+
+        let captured = ReminderBackupAdapter.capture(
+            original,
+            taskPresence: .absent
+        )
+        let stableEndDate = try requireValue(
+            original.recurrenceRules?.first?.recurrenceEnd?.endDate,
+            "EventKit did not expose the recurrence end date"
+        )
+        let capturedRule = try requireValue(
+            captured.recurrenceRules.first,
+            "end-date recurrence fixture was not captured"
+        )
+        try require(
+            capturedRule.endDate == stableEndDate,
+            "adapter did not preserve EventKit's stable recurrence end date"
+        )
+        let restored = EKReminder(eventStore: eventStore)
+        ReminderBackupAdapter.restore(captured, into: restored)
+        let restoredEndDate = try requireValue(
+            restored.recurrenceRules?.first?.recurrenceEnd?.endDate,
+            "adapter did not restore the recurrence end date"
+        )
+        let roundTrip = ReminderBackupAdapter.capture(
+            restored,
+            taskPresence: .absent
+        )
+        let roundTripRule = try requireValue(
+            roundTrip.recurrenceRules.first,
+            "end-date recurrence was not restored"
+        )
+
+        try require(
+            restoredEndDate == stableEndDate
+                && roundTripRule.endDate == stableEndDate,
+            "adapter changed EventKit's stable recurrence end date"
+        )
+        try require(
+            capturedRule.occurrenceCount == nil
+                && roundTripRule.occurrenceCount == nil,
+            "date-bounded recurrence must not become count-bounded"
         )
     }),
     ("prune target calendar selection fails closed on ambiguity", {

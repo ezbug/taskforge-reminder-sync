@@ -103,24 +103,76 @@ public enum ReminderPrunerError: Error, LocalizedError {
     }
 }
 
-private final class ReminderFetchResolution<Value>: @unchecked Sendable {
-    init(_ continuation: CheckedContinuation<Value, Error>) {
+private final class ReminderFetchResolution<
+    Value,
+    Handle: Sendable
+>: @unchecked Sendable {
+    init(
+        _ continuation: CheckedContinuation<Value, Error>,
+        cancel: @escaping @Sendable (Handle) -> Void
+    ) {
         self.continuation = continuation
+        self.cancel = cancel
     }
 
     func resolve(_ result: Result<Value, Error>) {
         lock.lock()
-        guard let continuation else {
+        guard !settled, let continuation else {
             lock.unlock()
             return
         }
+        settled = true
         self.continuation = nil
         lock.unlock()
         continuation.resume(with: result)
     }
 
+    func timeout() {
+        lock.lock()
+        guard !settled, let continuation else {
+            lock.unlock()
+            return
+        }
+        settled = true
+        timeoutWon = true
+        self.continuation = nil
+        let handleToCancel = cancellationHandleLocked()
+        lock.unlock()
+
+        if let handleToCancel {
+            cancel(handleToCancel)
+        }
+        continuation.resume(
+            throwing: ReminderPrunerError.reminderFetchFailed
+        )
+    }
+
+    func register(_ handle: Handle) {
+        lock.lock()
+        self.handle = handle
+        let handleToCancel = cancellationHandleLocked()
+        lock.unlock()
+
+        if let handleToCancel {
+            cancel(handleToCancel)
+        }
+    }
+
+    private func cancellationHandleLocked() -> Handle? {
+        guard timeoutWon, !cancelIssued, let handle else {
+            return nil
+        }
+        cancelIssued = true
+        return handle
+    }
+
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Value, Error>?
+    private var handle: Handle?
+    private var settled = false
+    private var timeoutWon = false
+    private var cancelIssued = false
+    private let cancel: @Sendable (Handle) -> Void
 }
 
 enum ReminderFetchWaiter {
@@ -129,7 +181,7 @@ enum ReminderFetchWaiter {
         @escaping @Sendable () -> Void
     ) -> Void
 
-    static func wait<Value>(
+    static func wait<Value, Handle: Sendable>(
         timeout: TimeInterval = 30,
         scheduleTimeout: @escaping TimeoutScheduler = {
             interval, timeout in
@@ -138,24 +190,46 @@ enum ReminderFetchWaiter {
                 execute: timeout
             )
         },
+        cancel: @escaping @Sendable (Handle) -> Void,
         start: (
             @escaping @Sendable (Result<Value, Error>) -> Void
-        ) -> Void
+        ) -> Handle
     ) async throws -> Value {
         try await withCheckedThrowingContinuation { continuation in
-            let resolution = ReminderFetchResolution<Value>(
-                continuation
+            let resolution = ReminderFetchResolution<Value, Handle>(
+                continuation,
+                cancel: cancel
             )
             scheduleTimeout(timeout) {
-                resolution.resolve(
-                    .failure(ReminderPrunerError.reminderFetchFailed)
-                )
+                resolution.timeout()
             }
-            start { result in
+            let handle = start { result in
                 resolution.resolve(result)
             }
+            resolution.register(handle)
         }
     }
+}
+
+private final class ReminderFetchRequestIdentifier: @unchecked Sendable {
+    init(_ rawValue: Any) {
+        self.rawValue = rawValue
+    }
+
+    let rawValue: Any
+}
+
+@MainActor
+private final class ReminderFetchCanceller {
+    init(eventStore: EKEventStore) {
+        self.eventStore = eventStore
+    }
+
+    func cancel(_ identifier: ReminderFetchRequestIdentifier) {
+        eventStore.cancelFetchRequest(identifier.rawValue)
+    }
+
+    private let eventStore: EKEventStore
 }
 
 @MainActor
@@ -664,18 +738,31 @@ public final class ReminderPruner {
         in calendar: EKCalendar
     ) async throws -> [EKReminder] {
         let predicate = eventStore.predicateForReminders(in: [calendar])
-        return try await ReminderFetchWaiter.wait(timeout: 30) {
-            completion in
-            _ = eventStore.fetchReminders(matching: predicate) { reminders in
-                guard let reminders else {
-                    completion(
-                        .failure(ReminderPrunerError.reminderFetchFailed)
-                    )
-                    return
+        let canceller = ReminderFetchCanceller(eventStore: eventStore)
+        return try await ReminderFetchWaiter.wait(
+            timeout: 30,
+            cancel: { identifier in
+                Task { @MainActor in
+                    canceller.cancel(identifier)
                 }
-                completion(.success(reminders))
+            },
+            start: { completion in
+                let identifier = eventStore.fetchReminders(
+                    matching: predicate
+                ) { reminders in
+                    guard let reminders else {
+                        completion(
+                            .failure(
+                                ReminderPrunerError.reminderFetchFailed
+                            )
+                        )
+                        return
+                    }
+                    completion(.success(reminders))
+                }
+                return ReminderFetchRequestIdentifier(identifier)
             }
-        }
+        )
     }
 
     private func restoreReadbackPairs(
