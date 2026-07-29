@@ -73,3 +73,111 @@ public enum ReminderPruneCandidatePolicy {
         return observation.taskPresence == .absent
     }
 }
+
+public struct ReminderPruneLedgerEntry: Codable, Equatable, Sendable {
+    public var firstSeen: Date
+    public var fingerprint: String
+    public var calendarIdentifier: String
+    public var rulesVersion: Int
+    public var graceUntil: Date?
+
+    public init(
+        firstSeen: Date,
+        fingerprint: String,
+        calendarIdentifier: String,
+        rulesVersion: Int,
+        graceUntil: Date?
+    ) {
+        self.firstSeen = firstSeen
+        self.fingerprint = fingerprint
+        self.calendarIdentifier = calendarIdentifier
+        self.rulesVersion = rulesVersion
+        self.graceUntil = graceUntil
+    }
+}
+
+public struct ReminderPruneLedger: Codable, Equatable, Sendable {
+    public var entries: [String: ReminderPruneLedgerEntry]
+
+    public init(entries: [String: ReminderPruneLedgerEntry] = [:]) {
+        self.entries = entries
+    }
+}
+
+public struct ReminderPrunePlan: Equatable, Sendable {
+    public let firstSeenIdentifiers: [String]
+    public let waitingIdentifiers: [String]
+    public let readyIdentifiers: [String]
+    public let revokedIdentifiers: [String]
+    public let nextLedger: ReminderPruneLedger
+}
+
+public enum ReminderPruneStateMachine {
+    public static let rulesVersion = 1
+
+    public static func plan(
+        observations: [ReminderPruneObservation],
+        prior: ReminderPruneLedger,
+        targetCalendarIdentifier: String,
+        now: Date,
+        confirmationInterval: TimeInterval = 60
+    ) -> ReminderPrunePlan {
+        var next = ReminderPruneLedger()
+        var firstSeen: [String] = []
+        var waiting: [String] = []
+        var ready: [String] = []
+        let candidates = observations.filter {
+            ReminderPruneCandidatePolicy.isCandidate(
+                $0,
+                targetCalendarIdentifier: targetCalendarIdentifier
+            )
+        }
+
+        for observation in candidates {
+            let old = prior.entries[observation.itemIdentifier]
+            let isSame = old?.fingerprint == observation.fingerprint
+                && old?.calendarIdentifier == observation.calendarIdentifier
+                && old?.rulesVersion == rulesVersion
+            if !isSame {
+                next.entries[observation.itemIdentifier] = ReminderPruneLedgerEntry(
+                    firstSeen: now,
+                    fingerprint: observation.fingerprint,
+                    calendarIdentifier: observation.calendarIdentifier,
+                    rulesVersion: rulesVersion,
+                    graceUntil: nil
+                )
+                firstSeen.append(observation.itemIdentifier)
+            } else if let old, let graceUntil = old.graceUntil {
+                if now < graceUntil {
+                    next.entries[observation.itemIdentifier] = old
+                    waiting.append(observation.itemIdentifier)
+                } else {
+                    next.entries[observation.itemIdentifier] = ReminderPruneLedgerEntry(
+                        firstSeen: now,
+                        fingerprint: observation.fingerprint,
+                        calendarIdentifier: observation.calendarIdentifier,
+                        rulesVersion: rulesVersion,
+                        graceUntil: nil
+                    )
+                    firstSeen.append(observation.itemIdentifier)
+                }
+            } else if let old, now.timeIntervalSince(old.firstSeen) >= confirmationInterval {
+                next.entries[observation.itemIdentifier] = old
+                ready.append(observation.itemIdentifier)
+            } else if let old {
+                next.entries[observation.itemIdentifier] = old
+                waiting.append(observation.itemIdentifier)
+            }
+        }
+
+        let active = Set(candidates.map(\.itemIdentifier))
+        let revoked = prior.entries.keys.filter { !active.contains($0) }.sorted()
+        return ReminderPrunePlan(
+            firstSeenIdentifiers: firstSeen.sorted(),
+            waitingIdentifiers: waiting.sorted(),
+            readyIdentifiers: ready.sorted(),
+            revokedIdentifiers: revoked,
+            nextLedger: next
+        )
+    }
+}

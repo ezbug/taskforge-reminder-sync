@@ -992,6 +992,162 @@ private let tests: [TestCase] = [
                 "\(presence) must fail closed"
             )
         }
+    }),
+    ("prune state requires two unchanged scans at least sixty seconds apart", {
+        let firstDate = Date(timeIntervalSince1970: 1_000)
+        let observation = ReminderPruneObservation(
+            itemIdentifier: "external",
+            calendarIdentifier: "calendar-target",
+            isCompleted: false,
+            priority: 0,
+            title: "普通提醒",
+            fingerprint: "stable",
+            taskPresence: .absent
+        )
+        let first = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: ReminderPruneLedger(),
+            targetCalendarIdentifier: "calendar-target",
+            now: firstDate
+        )
+        try require(first.readyIdentifiers.isEmpty, "first scan must not delete")
+        try require(first.firstSeenIdentifiers == ["external"], "candidate not recorded")
+
+        let early = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: first.nextLedger,
+            targetCalendarIdentifier: "calendar-target",
+            now: firstDate.addingTimeInterval(59)
+        )
+        try require(early.readyIdentifiers.isEmpty, "59 seconds is too early")
+
+        let ready = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: early.nextLedger,
+            targetCalendarIdentifier: "calendar-target",
+            now: firstDate.addingTimeInterval(60)
+        )
+        try require(ready.readyIdentifiers == ["external"], "candidate should be ready")
+    }),
+    ("prune state revokes or restarts changed candidates", {
+        let now = Date(timeIntervalSince1970: 2_000)
+        let original = ReminderPruneObservation(
+            itemIdentifier: "external",
+            calendarIdentifier: "calendar-target",
+            isCompleted: false,
+            priority: 0,
+            title: "普通提醒",
+            fingerprint: "v1",
+            taskPresence: .absent
+        )
+        let first = ReminderPruneStateMachine.plan(
+            observations: [original],
+            prior: ReminderPruneLedger(),
+            targetCalendarIdentifier: "calendar-target",
+            now: now
+        )
+        let changed = ReminderPruneObservation(
+            itemIdentifier: "external",
+            calendarIdentifier: "calendar-target",
+            isCompleted: false,
+            priority: 0,
+            title: "改过的提醒",
+            fingerprint: "v2",
+            taskPresence: .absent
+        )
+        let restarted = ReminderPruneStateMachine.plan(
+            observations: [changed],
+            prior: first.nextLedger,
+            targetCalendarIdentifier: "calendar-target",
+            now: now.addingTimeInterval(120)
+        )
+        try require(restarted.readyIdentifiers.isEmpty, "changed item must restart")
+        try require(
+            restarted.nextLedger.entries["external"]?.firstSeen
+                == now.addingTimeInterval(120),
+            "changed item should receive a new firstSeen"
+        )
+    }),
+    ("prune state restarts after restore grace and rule changes", {
+        let now = Date(timeIntervalSince1970: 3_000)
+        let observation = ReminderPruneObservation(
+            itemIdentifier: "restored",
+            calendarIdentifier: "calendar-target",
+            isCompleted: false,
+            priority: 0,
+            title: "恢复提醒",
+            fingerprint: "stable",
+            taskPresence: .absent
+        )
+        let prior = ReminderPruneLedger(entries: [
+            "restored": ReminderPruneLedgerEntry(
+                firstSeen: now.addingTimeInterval(-120),
+                fingerprint: "stable",
+                calendarIdentifier: "calendar-target",
+                rulesVersion: ReminderPruneStateMachine.rulesVersion,
+                graceUntil: now.addingTimeInterval(60)
+            )
+        ])
+        let duringGrace = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: prior,
+            targetCalendarIdentifier: "calendar-target",
+            now: now
+        )
+        try require(duringGrace.readyIdentifiers.isEmpty, "grace must protect")
+
+        let afterGrace = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: duringGrace.nextLedger,
+            targetCalendarIdentifier: "calendar-target",
+            now: now.addingTimeInterval(61)
+        )
+        try require(
+            afterGrace.firstSeenIdentifiers == ["restored"],
+            "expired grace must start a fresh first scan"
+        )
+        try require(afterGrace.readyIdentifiers.isEmpty, "grace expiry must not delete")
+
+        let oldRules = ReminderPruneLedger(entries: [
+            "restored": ReminderPruneLedgerEntry(
+                firstSeen: now.addingTimeInterval(-120),
+                fingerprint: "stable",
+                calendarIdentifier: "calendar-target",
+                rulesVersion: ReminderPruneStateMachine.rulesVersion - 1,
+                graceUntil: nil
+            )
+        ])
+        let versionReset = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: oldRules,
+            targetCalendarIdentifier: "calendar-target",
+            now: now
+        )
+        try require(
+            versionReset.firstSeenIdentifiers == ["restored"],
+            "rules change must restart confirmation"
+        )
+
+        let completed = ReminderPruneObservation(
+            itemIdentifier: "restored",
+            calendarIdentifier: "calendar-target",
+            isCompleted: true,
+            priority: 0,
+            title: "恢复提醒",
+            fingerprint: "completed",
+            taskPresence: .absent
+        )
+        let revoked = ReminderPruneStateMachine.plan(
+            observations: [completed],
+            prior: prior,
+            targetCalendarIdentifier: "calendar-target",
+            now: now
+        )
+        try require(
+            revoked.revokedIdentifiers == ["restored"],
+            "completed reminder must revoke its candidate"
+        )
+        try require(revoked.readyIdentifiers.isEmpty, "revoked item must not delete")
     })
 ]
 
