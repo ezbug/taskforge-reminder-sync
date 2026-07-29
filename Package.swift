@@ -43,6 +43,14 @@ let package = Package(
         .executableTarget(
             name: "TaskForgeReminderCLITests",
             path: "Tests/TaskForgeReminderCLITests"
+        ),
+        .executableTarget(
+            name: "TaskForgeReminderEventKitTests",
+            dependencies: [
+                "TaskForgeReminderCore",
+                "TaskForgeReminderEventKit"
+            ],
+            path: "Tests/TaskForgeReminderEventKitTests"
         )
     ]
 )
