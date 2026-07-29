@@ -1011,18 +1011,10 @@ git commit -m "feat(清理): 添加私有候选账本和备份"
     name: "TaskForgeReminderCoreTests",
     dependencies: ["TaskForgeReminderCore"],
     path: "Tests/TaskForgeReminderCoreTests"
-),
-.executableTarget(
-    name: "TaskForgeReminderEventKitTests",
-    dependencies: [
-        "TaskForgeReminderCore",
-        "TaskForgeReminderEventKit"
-    ],
-    path: "Tests/TaskForgeReminderEventKitTests"
 )
 ```
 
-先创建两个只含 import 的源文件和一个输出 `SKIP` 的测试入口，然后运行：
+先创建两个只含 import 的源文件，然后运行：
 
 ```bash
 swift build
@@ -1176,7 +1168,6 @@ swift run TaskForgeReminderCoreTests
 
 ```bash
 git add Package.swift Sources/TaskForgeReminderEventKit \
-  Tests/TaskForgeReminderEventKitTests/main.swift
 git commit -m "feat(EventKit): 实现可恢复提醒清理器"
 ```
 
@@ -1325,9 +1316,23 @@ git commit -m "feat(同步): 接入自动清理和恢复命令"
 
 **文件：**
 
-- 修改：`Tests/TaskForgeReminderEventKitTests/main.swift`
+- 修改：`Package.swift`
+- 创建：`Tests/TaskForgeReminderEventKitTests/main.swift`
 
-- [ ] **步骤 1：编写带显式开关的隔离测试入口**
+- [ ] **步骤 1：增加真实测试目标和带显式开关的隔离测试入口**
+
+在 `Package.swift` 增加：
+
+```swift
+.executableTarget(
+    name: "TaskForgeReminderEventKitTests",
+    dependencies: [
+        "TaskForgeReminderCore",
+        "TaskForgeReminderEventKit"
+    ],
+    path: "Tests/TaskForgeReminderEventKitTests"
+)
+```
 
 未设置环境变量时只输出：
 
@@ -1419,7 +1424,7 @@ TASKFORGE_RUN_EVENTKIT_TESTS=1 \
 - [ ] **步骤 5：提交隔离测试**
 
 ```bash
-git add Tests/TaskForgeReminderEventKitTests/main.swift
+git add Package.swift Tests/TaskForgeReminderEventKitTests/main.swift
 git commit -m "test(EventKit): 验证清理隔离和恢复闭环"
 ```
 
