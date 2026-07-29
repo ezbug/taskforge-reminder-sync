@@ -3,6 +3,7 @@ import Darwin
 import EventKit
 import Foundation
 import TaskForgeReminderCore
+import TaskForgeReminderEventKit
 
 struct SyncConfiguration {
     var listName: String
@@ -172,15 +173,36 @@ enum TaskSourceWriter {
 final class SyncEngine {
     private let configuration: SyncConfiguration
     private var calendar: Calendar
-    private let store = EKEventStore()
+    private let store: EKEventStore
+    private let pruner: ReminderPruner
     private var reminderObserver: NSObjectProtocol?
     private var reminderDebounceTask: Task<Void, Never>?
     private var isReconciling = false
     private var needsAnotherPass = false
 
     init(configuration: SyncConfiguration, calendar: Calendar) {
+        let store = EKEventStore()
         self.configuration = configuration
         self.calendar = calendar
+        self.store = store
+        self.pruner = ReminderPruner(
+            eventStore: store,
+            configuration: ReminderPruneConfiguration(
+                listName: configuration.listName,
+                localRoot: ReminderPruneLocalStore.defaultRoot,
+                confirmationInterval: 60,
+                restoreGraceInterval: 86_400
+            ),
+            log: { message in
+                print("[\(ISO8601DateFormatter().string(from: Date()))] \(message)")
+            },
+            logError: { message in
+                fputs(
+                    "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n",
+                    stderr
+                )
+            }
+        )
     }
 
     deinit {
@@ -556,6 +578,17 @@ final class SyncEngine {
         return counts
     }
 
+    func prune(dryRun: Bool) async throws -> ReminderPruneCounts {
+        let snapshot = try loadSnapshotWithRetry()
+        return dryRun
+            ? try await pruner.dryRun(snapshot: snapshot)
+            : try await pruner.advance(snapshot: snapshot)
+    }
+
+    func restoreLastPrune() async throws -> ReminderPruneCounts {
+        try await pruner.restoreLast()
+    }
+
     func reconcile(reason: String) async {
         if isReconciling {
             needsAnotherPass = true
@@ -578,6 +611,12 @@ final class SyncEngine {
                         + "跳过 \(reverseCounts.skipped)，失败 \(reverseCounts.failed)"
                 )
                 _ = try await forward()
+                let pruneCounts = try await prune(dryRun: false)
+                log(
+                    "清理同步：首次 \(pruneCounts.firstSeen)，"
+                        + "等待 \(pruneCounts.waiting)，删除 \(pruneCounts.deleted)，"
+                        + "失败 \(pruneCounts.failed)"
+                )
             } catch {
                 logError("双向同步失败：\(error.localizedDescription)")
             }

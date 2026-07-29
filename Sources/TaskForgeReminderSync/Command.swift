@@ -11,6 +11,9 @@ private enum RunMode {
     case sync
     case reverseDryRun
     case reverseOnce
+    case pruneDryRun
+    case pruneOnce
+    case restoreLastPrune
     case watch
     case help
 }
@@ -45,6 +48,12 @@ private struct Options {
                 options.mode = .reverseDryRun
             case "--reverse-once":
                 options.mode = .reverseOnce
+            case "--prune-dry-run":
+                options.mode = .pruneDryRun
+            case "--prune-once":
+                options.mode = .pruneOnce
+            case "--restore-last-prune":
+                options.mode = .restoreLastPrune
             case "--watch":
                 options.mode = .watch
             case "--help", "-h":
@@ -151,7 +160,8 @@ private struct TaskForgeReminderSyncCommand {
             case .dryRun:
                 try printPreview(options: options, calendar: calendar)
             case .audit, .deduplicateDryRun, .deduplicate,
-                 .sync, .reverseDryRun, .reverseOnce, .watch:
+                 .sync, .reverseDryRun, .reverseOnce, .pruneDryRun,
+                 .pruneOnce, .restoreLastPrune, .watch:
                 try await run(options: options, calendar: calendar)
             }
         } catch {
@@ -228,11 +238,14 @@ private struct TaskForgeReminderSyncCommand {
                 requireCandidate: options.taskIdentifier != nil
             )
             let forward = try await engine.forward()
+            let prune = try await engine.prune(dryRun: false)
             print(
                 "双向同步完成：反向写入 \(reverse.written)，"
                     + "正向新建 \(forward.created)，更新 \(forward.updated)，"
                     + "重新关联 \(forward.relinked)，无需变化 \(forward.unchanged)，"
-                    + "冲突 \(forward.conflicts)。"
+                    + "冲突 \(forward.conflicts)；"
+                    + "清理首次 \(prune.firstSeen)，等待 \(prune.waiting)，"
+                    + "删除 \(prune.deleted)，失败 \(prune.failed)。"
             )
         case .reverseDryRun:
             let counts = try await engine.reverse(
@@ -248,6 +261,25 @@ private struct TaskForgeReminderSyncCommand {
                 requireCandidate: true
             )
             print("反向同步完成：写入 \(counts.written)，失败 \(counts.failed)。")
+        case .pruneDryRun:
+            let counts = try await engine.prune(dryRun: true)
+            print(
+                "清理预演：扫描 \(counts.scanned)，首次候选 \(counts.firstSeen)，"
+                    + "已满足二次确认 \(counts.ready)。"
+            )
+            print("预演模式：没有写候选账本，没有删除提醒。")
+        case .pruneOnce:
+            let counts = try await engine.prune(dryRun: false)
+            print(
+                "清理推进：扫描 \(counts.scanned)，首次 \(counts.firstSeen)，"
+                    + "等待 \(counts.waiting)，删除 \(counts.deleted)，"
+                    + "失败 \(counts.failed)。"
+            )
+        case .restoreLastPrune:
+            let counts = try await engine.restoreLastPrune()
+            print(
+                "清理恢复：恢复 \(counts.restored)，失败 \(counts.failed)。"
+            )
         case .watch:
             try await engine.watch()
         case .checkConfig, .dryRun, .help:
@@ -313,6 +345,9 @@ private struct TaskForgeReminderSyncCommand {
               TaskForgeReminderSync --sync [--task-id ID]
               TaskForgeReminderSync --reverse-dry-run [--task-id ID]
               TaskForgeReminderSync --reverse-once --task-id ID
+              TaskForgeReminderSync --prune-dry-run
+              TaskForgeReminderSync --prune-once
+              TaskForgeReminderSync --restore-last-prune
               TaskForgeReminderSync --watch
 
             选项：
@@ -327,6 +362,9 @@ private struct TaskForgeReminderSyncCommand {
               --deduplicate          将冗余活跃提醒移到可恢复的归档列表
               --reverse-dry-run     预览 Apple 完成状态的反向写入
               --reverse-once        执行一次反向写入并等待 TaskForge 回读
+              --prune-dry-run       只读预演提醒清理，不写候选账本
+              --prune-once          推进一轮双扫描确认和清理
+              --restore-last-prune  恢复最近一批已删除提醒
               --sync                反向写入后再正向同步一次
               --watch               常驻近实时双向同步
             """
