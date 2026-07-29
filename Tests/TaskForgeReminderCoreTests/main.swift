@@ -1403,30 +1403,32 @@ private let tests: [TestCase] = [
             )
         }
     }),
-    ("prune local store creates one shared hash salt under concurrency", {
+    ("prune local stores create one shared hash salt across instances", {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let store = ReminderPruneLocalStore(rootURL: root)
+        let stores = (0..<32).map { _ in
+            ReminderPruneLocalStore(rootURL: root)
+        }
         let queue = DispatchQueue(label: "prune-salt", attributes: .concurrent)
         let group = DispatchGroup()
         let start = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var salts: [Data] = []
-        var failures: [Error] = []
+        var failures: [String] = []
 
-        for _ in 0..<32 {
+        for index in stores.indices {
             group.enter()
             queue.async {
                 start.wait()
                 do {
-                    let salt = try store.loadOrCreateHashSalt()
+                    let salt = try stores[index].loadOrCreateHashSalt()
                     lock.lock()
                     salts.append(salt)
                     lock.unlock()
                 } catch {
                     lock.lock()
-                    failures.append(error)
+                    failures.append(String(describing: error))
                     lock.unlock()
                 }
                 group.leave()
@@ -1437,11 +1439,19 @@ private let tests: [TestCase] = [
         }
         group.wait()
 
-        try require(failures.isEmpty, "concurrent salt creation failed")
+        try require(
+            failures.isEmpty,
+            "concurrent salt creation failed: \(failures)"
+        )
         try require(salts.count == 32, "missing concurrent salt result")
         try require(
             salts.dropFirst().allSatisfy { $0 == salts[0] },
             "concurrent callers received different salts"
+        )
+        try require(
+            try ReminderPruneLocalStore(rootURL: root).loadOrCreateHashSalt()
+                == salts[0],
+            "persisted salt differs from concurrent callers"
         )
     })
 ]

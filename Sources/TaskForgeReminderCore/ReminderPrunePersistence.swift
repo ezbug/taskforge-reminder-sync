@@ -267,11 +267,20 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     public func loadOrCreateHashSalt() throws -> Data {
-        saltLock.lock()
-        defer { saltLock.unlock() }
+        Self.saltSetupLock.lock()
+        defer { Self.saltSetupLock.unlock() }
 
         try ensureDirectory(rootURL)
         let saltURL = rootURL.appendingPathComponent("PruneHashSalt")
+        let lockURL = rootURL.appendingPathComponent("PruneHashSalt.lock")
+        let lockDescriptor = try openSaltLock(at: lockURL)
+        defer { _ = close(lockDescriptor) }
+        guard flock(lockDescriptor, LOCK_EX) == 0 else {
+            throw ReminderPruneStoreError.permissions
+        }
+        defer { _ = flock(lockDescriptor, LOCK_UN) }
+
+        try ensurePrivateFile(lockURL)
         if try itemExists(at: saltURL) {
             try ensurePrivateFile(saltURL)
             let salt = try readData(at: saltURL, error: .invalidBackup)
@@ -287,7 +296,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     private let fileManager = FileManager.default
-    private let saltLock = NSLock()
+    private static let saltSetupLock = NSLock()
 
     private var encoder: JSONEncoder {
         let encoder = JSONEncoder()
@@ -391,6 +400,30 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         }
         acl_free(UnsafeMutableRawPointer(acl))
         throw ReminderPruneStoreError.permissions
+    }
+
+    private func openSaltLock(at url: URL) throws -> Int32 {
+        let descriptor = open(
+            url.path,
+            O_RDWR | O_CREAT | O_EXCL,
+            mode_t(0o600)
+        )
+        if descriptor >= 0 {
+            guard fchmod(descriptor, mode_t(0o600)) == 0 else {
+                _ = close(descriptor)
+                throw ReminderPruneStoreError.permissions
+            }
+            return descriptor
+        }
+        guard errno == EEXIST else {
+            throw ReminderPruneStoreError.permissions
+        }
+
+        let existingDescriptor = open(url.path, O_RDWR)
+        guard existingDescriptor >= 0 else {
+            throw ReminderPruneStoreError.permissions
+        }
+        return existingDescriptor
     }
 
     private func itemExists(at url: URL) throws -> Bool {
