@@ -34,14 +34,14 @@ public struct ReminderPruneCounts: Equatable, Sendable {
 }
 
 public enum ReminderPrunerError: Error, LocalizedError {
-    case noReminderSource
+    case backupReminderSourceUnavailable
     case backupVerificationFailed
     case restoredReminderReadbackFailed
 
     public var errorDescription: String? {
         switch self {
-        case .noReminderSource:
-            return "找不到可以创建提醒事项列表的账户。"
+        case .backupReminderSourceUnavailable:
+            return "找不到备份指定的提醒事项账户，备份仍未消费。"
         case .backupVerificationFailed:
             return "清理备份写入后的回读校验失败。"
         case .restoredReminderReadbackFailed:
@@ -169,6 +169,8 @@ public final class ReminderPruner {
             createdAt: now,
             targetCalendarIdentifier: targetCalendar.calendarIdentifier,
             targetCalendarTitle: targetCalendar.title,
+            targetSourceIdentifier:
+                targetCalendar.source.sourceIdentifier,
             items: confirmed.map(ReminderBackupAdapter.capture),
             restoredAt: nil
         )
@@ -239,9 +241,7 @@ public final class ReminderPruner {
         let calendar = try targetCalendar()
             ?? createTargetCalendar(
                 title: backup.targetCalendarTitle,
-                preferredSource: eventStore.calendar(
-                    withIdentifier: backup.targetCalendarIdentifier
-                )?.source
+                sourceIdentifier: backup.targetSourceIdentifier
             )
         var created: [EKReminder] = []
         do {
@@ -322,14 +322,12 @@ public final class ReminderPruner {
 
     private func createTargetCalendar(
         title: String,
-        preferredSource: EKSource?
+        sourceIdentifier: String
     ) throws -> EKCalendar {
-        guard
-            let source = preferredSource
-                ?? eventStore.defaultCalendarForNewReminders()?.source
-                ?? eventStore.calendars(for: .reminder).first?.source
-        else {
-            throw ReminderPrunerError.noReminderSource
+        guard let source = eventStore.sources.first(where: {
+            $0.sourceIdentifier == sourceIdentifier
+        }) else {
+            throw ReminderPrunerError.backupReminderSourceUnavailable
         }
         let calendar = EKCalendar(for: .reminder, eventStore: eventStore)
         calendar.title = title

@@ -126,6 +126,7 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
     public var createdAt: Date
     public var targetCalendarIdentifier: String
     public var targetCalendarTitle: String
+    public var targetSourceIdentifier: String
     public var items: [ReminderPruneBackupItem]
     public var restoredAt: Date?
 
@@ -134,6 +135,7 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
         createdAt: Date,
         targetCalendarIdentifier: String,
         targetCalendarTitle: String,
+        targetSourceIdentifier: String,
         items: [ReminderPruneBackupItem],
         restoredAt: Date?
     ) {
@@ -141,6 +143,7 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
         self.createdAt = createdAt
         self.targetCalendarIdentifier = targetCalendarIdentifier
         self.targetCalendarTitle = targetCalendarTitle
+        self.targetSourceIdentifier = targetSourceIdentifier
         self.items = items
         self.restoredAt = restoredAt
     }

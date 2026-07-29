@@ -192,6 +192,7 @@ private func pruneBackupFixture() -> ReminderPruneBackupBatch {
         createdAt: Date(timeIntervalSince1970: 20),
         targetCalendarIdentifier: "calendar",
         targetCalendarTitle: "TaskForge 今日",
+        targetSourceIdentifier: "source",
         items: [
             ReminderPruneBackupItem(
                 originalItemIdentifier: "item",
@@ -1256,7 +1257,12 @@ private let tests: [TestCase] = [
 
         let batch = pruneBackupFixture()
         let url = try store.saveBackup(batch)
-        try require(try store.loadBackup(at: url) == batch, "backup verification failed")
+        let loadedBatch = try store.loadBackup(at: url)
+        try require(loadedBatch == batch, "backup verification failed")
+        try require(
+            loadedBatch.targetSourceIdentifier == "source",
+            "backup source identifier round-trip failed"
+        )
     }),
     ("prune local store rejects a modified backup", {
         let root = FileManager.default.temporaryDirectory
