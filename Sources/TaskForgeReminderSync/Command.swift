@@ -16,6 +16,37 @@ private enum RunMode {
     case restoreLastPrune
     case watch
     case help
+
+    var parseOnlyLabel: String {
+        switch self {
+        case .checkConfig:
+            return "check-config"
+        case .dryRun:
+            return "dry-run"
+        case .audit:
+            return "audit"
+        case .deduplicateDryRun:
+            return "deduplicate-dry-run"
+        case .deduplicate:
+            return "deduplicate"
+        case .sync:
+            return "sync"
+        case .reverseDryRun:
+            return "reverse-dry-run"
+        case .reverseOnce:
+            return "reverse-once"
+        case .pruneDryRun:
+            return "prune-dry-run"
+        case .pruneOnce:
+            return "prune-once"
+        case .restoreLastPrune:
+            return "restore-last-prune"
+        case .watch:
+            return "watch"
+        case .help:
+            return "help"
+        }
+    }
 }
 
 private enum CommandParsingError: Error, LocalizedError {
@@ -178,7 +209,7 @@ private struct TaskForgeReminderSyncCommand {
                     "TASKFORGE_REMINDER_SYNC_TEST_PARSE_ONLY"
                 ] == "1"
             {
-                print("参数解析完成")
+                print("parse-mode=\(options.mode.parseOnlyLabel)")
                 return
             }
             #endif

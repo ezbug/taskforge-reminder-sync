@@ -13,10 +13,13 @@ private func require(
     }
 }
 
-private func runConflictingModes(
-    _ arguments: [String],
-    label: String
-) throws {
+private struct ParserResult {
+    let status: Int32
+    let output: String
+    let error: String
+}
+
+private func runParser(_ arguments: [String]) throws -> ParserResult {
     let executable = URL(fileURLWithPath: CommandLine.arguments[0])
         .deletingLastPathComponent()
         .appendingPathComponent("TaskForgeReminderSync")
@@ -43,26 +46,63 @@ private func runConflictingModes(
         encoding: .utf8
     ) ?? ""
 
+    return ParserResult(
+        status: process.terminationStatus,
+        output: output,
+        error: error
+    )
+}
+
+private func runConflictingModes(
+    _ arguments: [String],
+    label: String
+) throws {
+    let result = try runParser(arguments)
     try require(
-        process.terminationStatus == 1,
+        result.status == 1,
         "\(label): conflicting modes must fail before execution"
     )
     try require(
-        error.contains("不能同时指定多个运行模式"),
+        result.error.contains("不能同时指定多个运行模式"),
         "\(label): failure must use the anonymous conflict error"
     )
     for argument in arguments {
         try require(
-            !error.contains(argument),
+            !result.error.contains(argument),
             "\(label): error must not echo a raw argument"
         )
     }
     try require(
-        !output.contains("提醒事项权限")
-            && !error.contains("提醒事项权限")
-            && !output.contains("EventKit")
-            && !error.contains("EventKit"),
+        !result.output.contains("提醒事项权限")
+            && !result.error.contains("提醒事项权限")
+            && !result.output.contains("EventKit")
+            && !result.error.contains("EventKit"),
         "\(label): conflict must fail before EventKit access"
+    )
+}
+
+private func requireMode(
+    _ arguments: [String],
+    expected: String,
+    label: String
+) throws {
+    let result = try runParser(arguments)
+    try require(
+        result.status == 0,
+        "\(label): one mode should parse successfully"
+    )
+    try require(
+        result.output == "parse-mode=\(expected)\n",
+        "\(label): unexpected anonymous mode label \(result.output)"
+    )
+    try require(
+        result.error.isEmpty,
+        "\(label): parse-only mode wrote stderr"
+    )
+    try require(
+        !result.output.contains("提醒事项权限")
+            && !result.output.contains("EventKit"),
+        "\(label): parse-only mode reached EventKit"
     )
 }
 
@@ -74,6 +114,23 @@ private let conflictPairs = [
     ["--prune-once", "--prune-once"]
 ]
 
+private let singleModes: [([String], String)] = [
+    ([], "dry-run"),
+    (["--check-config"], "check-config"),
+    (["--dry-run"], "dry-run"),
+    (["--audit"], "audit"),
+    (["--deduplicate-dry-run"], "deduplicate-dry-run"),
+    (["--deduplicate"], "deduplicate"),
+    (["--sync"], "sync"),
+    (["--reverse-dry-run"], "reverse-dry-run"),
+    (["--reverse-once"], "reverse-once"),
+    (["--prune-dry-run"], "prune-dry-run"),
+    (["--prune-once"], "prune-once"),
+    (["--restore-last-prune"], "restore-last-prune"),
+    (["--watch"], "watch"),
+    (["--help"], "help")
+]
+
 do {
     for (index, pair) in conflictPairs.enumerated() {
         try runConflictingModes(pair, label: "pair \(index + 1) forward")
@@ -82,8 +139,15 @@ do {
             label: "pair \(index + 1) reverse"
         )
     }
-    let testCount = conflictPairs.count * 2
-    print("\(testCount)/\(testCount) CLI parser conflict tests passed")
+    for (arguments, expected) in singleModes {
+        try requireMode(
+            arguments,
+            expected: expected,
+            label: arguments.first ?? "no mode"
+        )
+    }
+    let testCount = conflictPairs.count * 2 + singleModes.count
+    print("\(testCount)/\(testCount) CLI parser tests passed")
 } catch {
     fputs("FAIL  \(error)\n", stderr)
     exit(1)
