@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import TaskForgeReminderCore
 
@@ -1263,13 +1264,185 @@ private let tests: [TestCase] = [
         defer { try? FileManager.default.removeItem(at: root) }
         let store = ReminderPruneLocalStore(rootURL: root)
         let url = try store.saveBackup(pruneBackupFixture())
-        try Data("tampered".utf8).write(to: url, options: .atomic)
+        let object = try requireValue(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+                as? [String: Any],
+            "backup envelope should be JSON"
+        )
+        var modified = object
+        var payload = try requireValue(
+            object["payload"] as? [String: Any],
+            "backup payload should be an object"
+        )
+        payload["targetCalendarTitle"] = "tampered"
+        modified["payload"] = payload
+        try JSONSerialization.data(
+            withJSONObject: modified,
+            options: [.sortedKeys]
+        ).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
         do {
             _ = try store.loadBackup(at: url)
             throw TestFailure(description: "tampered backup was accepted")
         } catch let error as ReminderPruneStoreError {
             try require(error == .checksumMismatch, "unexpected store error")
         }
+    }),
+    ("prune local store refuses insecure overwrite before replacing the ledger", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let original = ReminderPruneLedger(entries: [:])
+        let replacement = ReminderPruneLedger(entries: [
+            "item": ReminderPruneLedgerEntry(
+                firstSeen: Date(timeIntervalSince1970: 100),
+                fingerprint: "replacement",
+                calendarIdentifier: "calendar",
+                rulesVersion: 1,
+                graceUntil: nil
+            )
+        ])
+        try store.saveLedger(original)
+        let originalData = try Data(contentsOf: store.ledgerURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: store.ledgerURL.path
+        )
+
+        do {
+            try store.saveLedger(replacement)
+            throw TestFailure(description: "insecure ledger was overwritten")
+        } catch let error as ReminderPruneStoreError {
+            try require(error == .permissions, "unexpected overwrite error")
+        }
+        try require(
+            try Data(contentsOf: store.ledgerURL) == originalData,
+            "insecure ledger contents changed before rejection"
+        )
+        let permissions = try requireValue(
+            FileManager.default.attributesOfItem(
+                atPath: store.ledgerURL.path
+            )[.posixPermissions] as? NSNumber,
+            "ledger permissions missing"
+        )
+        try require(
+            permissions.intValue & 0o777 == 0o644,
+            "insecure ledger permissions changed before rejection"
+        )
+    }),
+    ("prune local store fails closed for corrupt ledger and backup inventory", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        try store.saveLedger(ReminderPruneLedger())
+        try Data("not ledger json".utf8).write(to: store.ledgerURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: store.ledgerURL.path
+        )
+        do {
+            _ = try store.loadLedger()
+            throw TestFailure(description: "corrupt ledger returned an empty ledger")
+        } catch let error as ReminderPruneStoreError {
+            try require(error == .invalidLedger, "unexpected corrupt ledger error")
+        }
+
+        let backupURL = try store.saveBackup(pruneBackupFixture())
+        try Data("not backup json".utf8).write(to: backupURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: backupURL.path
+        )
+        do {
+            _ = try store.latestUnrestoredBackup()
+            throw TestFailure(description: "corrupt backup was ignored")
+        } catch let error as ReminderPruneStoreError {
+            try require(error == .checksumMismatch, "unexpected corrupt backup error")
+        }
+    }),
+    ("prune local store preserves restored backups and private runtime permissions", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let backupURL = try store.saveBackup(pruneBackupFixture())
+        let restoredAt = Date(timeIntervalSince1970: 99)
+        try store.markRestored(at: backupURL, date: restoredAt)
+        try require(
+            try store.loadBackup(at: backupURL).restoredAt == restoredAt,
+            "restored backup must still verify"
+        )
+        try require(
+            try store.latestUnrestoredBackup() == nil,
+            "restored backup must not remain latest unrestored"
+        )
+
+        let salt = try store.loadOrCreateHashSalt()
+        try require(salt.count == 32, "salt must be 32 bytes")
+        try require(salt == store.loadOrCreateHashSalt(), "salt should be reused")
+        for (url, expected) in [
+            (root, 0o700),
+            (backupURL.deletingLastPathComponent(), 0o700),
+            (backupURL, 0o600),
+            (root.appendingPathComponent("PruneHashSalt"), 0o600)
+        ] {
+            let permissions = try requireValue(
+                FileManager.default.attributesOfItem(
+                    atPath: url.path
+                )[.posixPermissions] as? NSNumber,
+                "permissions missing for \(url.lastPathComponent)"
+            )
+            try require(
+                permissions.intValue & 0o777 == expected,
+                "unexpected permissions for \(url.lastPathComponent)"
+            )
+        }
+    }),
+    ("prune local store creates one shared hash salt under concurrency", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let queue = DispatchQueue(label: "prune-salt", attributes: .concurrent)
+        let group = DispatchGroup()
+        let start = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var salts: [Data] = []
+        var failures: [Error] = []
+
+        for _ in 0..<32 {
+            group.enter()
+            queue.async {
+                start.wait()
+                do {
+                    let salt = try store.loadOrCreateHashSalt()
+                    lock.lock()
+                    salts.append(salt)
+                    lock.unlock()
+                } catch {
+                    lock.lock()
+                    failures.append(error)
+                    lock.unlock()
+                }
+                group.leave()
+            }
+        }
+        for _ in 0..<32 {
+            start.signal()
+        }
+        group.wait()
+
+        try require(failures.isEmpty, "concurrent salt creation failed")
+        try require(salts.count == 32, "missing concurrent salt result")
+        try require(
+            salts.dropFirst().allSatisfy { $0 == salts[0] },
+            "concurrent callers received different salts"
+        )
     })
 ]
 

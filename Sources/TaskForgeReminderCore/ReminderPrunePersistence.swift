@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public struct ReminderLocationBackup: Codable, Equatable, Sendable {
@@ -173,7 +174,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
 
     public func loadLedger() throws -> ReminderPruneLedger {
         try ensureDirectory(rootURL)
-        guard fileManager.fileExists(atPath: ledgerURL.path) else {
+        guard try itemExists(at: ledgerURL) else {
             return ReminderPruneLedger()
         }
 
@@ -266,9 +267,12 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     public func loadOrCreateHashSalt() throws -> Data {
+        saltLock.lock()
+        defer { saltLock.unlock() }
+
         try ensureDirectory(rootURL)
         let saltURL = rootURL.appendingPathComponent("PruneHashSalt")
-        if fileManager.fileExists(atPath: saltURL.path) {
+        if try itemExists(at: saltURL) {
             try ensurePrivateFile(saltURL)
             let salt = try readData(at: saltURL, error: .invalidBackup)
             guard salt.count == 32 else {
@@ -283,6 +287,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     private let fileManager = FileManager.default
+    private let saltLock = NSLock()
 
     private var encoder: JSONEncoder {
         let encoder = JSONEncoder()
@@ -330,9 +335,11 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     private func ensureDirectory(_ url: URL) throws {
-        var isDirectory: ObjCBool = false
-        if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-            guard isDirectory.boolValue else {
+        if let attributes = try attributesIfItemExists(at: url) {
+            guard
+                attributes[.type] as? String
+                    == FileAttributeType.typeDirectory.rawValue
+            else {
                 throw ReminderPruneStoreError.permissions
             }
         } else {
@@ -343,7 +350,9 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
                     attributes: [.posixPermissions: 0o700]
                 )
             } catch {
-                throw ReminderPruneStoreError.permissions
+                guard try attributesIfItemExists(at: url) != nil else {
+                    throw ReminderPruneStoreError.permissions
+                }
             }
         }
         try ensurePermissions(of: url, expected: 0o700)
@@ -354,18 +363,59 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     private func ensurePermissions(of url: URL, expected: Int) throws {
-        let attributes: [FileAttributeKey: Any]
+        guard let attributes = try attributesIfItemExists(at: url) else {
+            throw ReminderPruneStoreError.permissions
+        }
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+            ?? (attributes[.posixPermissions] as? Int)
+        guard let permissions, permissions & 0o777 == expected else {
+            throw ReminderPruneStoreError.permissions
+        }
+        try ensureOwnedByCurrentUser(url)
+        try ensureNoExtendedACL(url)
+    }
+
+    private func ensureOwnedByCurrentUser(_ url: URL) throws {
+        var status = stat()
+        guard lstat(url.path, &status) == 0, status.st_uid == getuid() else {
+            throw ReminderPruneStoreError.permissions
+        }
+    }
+
+    private func ensureNoExtendedACL(_ url: URL) throws {
+        guard let acl = acl_get_file(url.path, ACL_TYPE_EXTENDED) else {
+            guard errno == ENOENT else {
+                throw ReminderPruneStoreError.permissions
+            }
+            return
+        }
+        acl_free(UnsafeMutableRawPointer(acl))
+        throw ReminderPruneStoreError.permissions
+    }
+
+    private func itemExists(at url: URL) throws -> Bool {
+        try attributesIfItemExists(at: url) != nil
+    }
+
+    private func attributesIfItemExists(
+        at url: URL
+    ) throws -> [FileAttributeKey: Any]? {
         do {
-            attributes = try fileManager.attributesOfItem(atPath: url.path)
+            return try fileManager.attributesOfItem(atPath: url.path)
         } catch {
-            throw ReminderPruneStoreError.permissions
+            guard isNoSuchFileError(error) else {
+                throw ReminderPruneStoreError.permissions
+            }
+            return nil
         }
-        guard
-            let permissions = attributes[.posixPermissions] as? NSNumber,
-            permissions.intValue & 0o777 == expected
-        else {
-            throw ReminderPruneStoreError.permissions
-        }
+    }
+
+    private func isNoSuchFileError(_ error: Error) -> Bool {
+        let error = error as NSError
+        return (error.domain == NSCocoaErrorDomain
+            && (error.code == NSFileNoSuchFileError
+                || error.code == NSFileReadNoSuchFileError))
+            || (error.domain == NSPOSIXErrorDomain && error.code == ENOENT)
     }
 
     private func readData(
@@ -403,8 +453,14 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             )
             try ensurePrivateFile(temporaryURL)
 
-            if fileManager.fileExists(atPath: url.path) {
-                _ = try fileManager.replaceItemAt(url, withItemAt: temporaryURL)
+            if try itemExists(at: url) {
+                try ensurePrivateFile(url)
+                _ = try fileManager.replaceItemAt(
+                    url,
+                    withItemAt: temporaryURL,
+                    backupItemName: nil,
+                    options: [.usingNewMetadataOnly]
+                )
             } else {
                 try fileManager.moveItem(at: temporaryURL, to: url)
             }
