@@ -60,7 +60,7 @@ Swift Package Manager、LaunchAgent、macOS 13+
 - `CHANGELOG.md`
   - 记录自动清理功能。
 
-## 任务 1：建立重要标记与候选判定策略
+## Task 1：建立重要标记与候选判定策略
 
 **文件：**
 
@@ -279,7 +279,7 @@ git add Sources/TaskForgeReminderCore/ReminderPruning.swift \
 git commit -m "feat(清理): 添加提醒候选安全策略"
 ```
 
-## 任务 2：实现真实源任务存在性检查
+## Task 2：实现真实源任务存在性检查
 
 **文件：**
 
@@ -440,7 +440,7 @@ git add Sources/TaskForgeReminderCore/Core.swift \
 git commit -m "feat(清理): 验证历史任务真实源"
 ```
 
-## 任务 3：实现双扫描确认状态机
+## Task 3：实现双扫描确认状态机
 
 **文件：**
 
@@ -754,7 +754,7 @@ git add Sources/TaskForgeReminderCore/ReminderPruning.swift \
 git commit -m "feat(清理): 添加双扫描确认状态机"
 ```
 
-## 任务 4：实现本机候选账本和可校验备份
+## Task 4：实现本机候选账本和可校验备份
 
 **文件：**
 
@@ -983,7 +983,7 @@ git add Sources/TaskForgeReminderCore/ReminderPrunePersistence.swift \
 git commit -m "feat(清理): 添加私有候选账本和备份"
 ```
 
-## 任务 5：建立 EventKit 清理库和备份适配
+## Task 5：建立 EventKit 清理库和备份适配
 
 **文件：**
 
@@ -1171,7 +1171,7 @@ git add Package.swift Sources/TaskForgeReminderEventKit \
 git commit -m "feat(EventKit): 实现可恢复提醒清理器"
 ```
 
-## 任务 6：接入命令行和同步循环
+## Task 6：接入命令行和同步循环
 
 **文件：**
 
@@ -1312,7 +1312,7 @@ git add Sources/TaskForgeReminderSync/Command.swift \
 git commit -m "feat(同步): 接入自动清理和恢复命令"
 ```
 
-## 任务 7：完成隔离 EventKit 端到端测试
+## Task 7：完成隔离 EventKit 端到端测试
 
 **文件：**
 
@@ -1428,7 +1428,7 @@ git add Package.swift Tests/TaskForgeReminderEventKitTests/main.swift
 git commit -m "test(EventKit): 验证清理隔离和恢复闭环"
 ```
 
-## 任务 8：更新公共文档和隐私边界
+## Task 8：更新公共文档和隐私边界
 
 **文件：**
 
@@ -1492,7 +1492,7 @@ git add .gitignore README.md docs/ARCHITECTURE.md \
 git commit -m "docs(清理): 说明自动删除和恢复边界"
 ```
 
-## 任务 9：完整验证、生产部署和 GitHub 发布
+## Task 9：完整验证、生产部署和 GitHub 发布
 
 **文件：**
 
