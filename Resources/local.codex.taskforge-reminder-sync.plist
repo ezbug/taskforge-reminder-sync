@@ -6,8 +6,8 @@
     <string>local.codex.taskforge-reminder-sync</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__EXECUTABLE__</string>
-        <string>--watch</string>
+        <string>/bin/zsh</string>
+        <string>__LAUNCHER__</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

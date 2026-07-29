@@ -9,6 +9,16 @@ Open:
 Enable **TaskForge Reminder Sync**. If the TaskForge cache or Vault cannot be
 read, also check **Full Disk Access**.
 
+If a manual `--sync` works but the LaunchAgent does not write a startup log,
+re-run `./scripts/install-daily-sync.sh`. Current releases start the bundle
+through LaunchServices so the background process retains the same Reminders
+permission identity as the app.
+
+Locally rebuilt ad hoc-signed apps receive a version-specific code identity.
+After rebuilding, re-authorize the newly installed app. To preserve identity
+across builds, use a stable code-signing certificate via
+`TASKFORGE_SYNC_CODESIGN_IDENTITY`; the project never creates one automatically.
+
 ## LaunchAgent is not running
 
 ```bash
@@ -35,6 +45,18 @@ Run:
 ```
 
 Confirm the task is scheduled for today and is not already done or cancelled.
+
+## A TaskForge edit reports a deduplication conflict
+
+The forward log includes `冲突 N`. A conflict means more than one TaskForge
+record or managed reminder carries the same ID/source identity. The tool does
+not select one arbitrarily and does not create another reminder.
+
+1. Stop editing the affected task briefly and let TaskForge finish re-indexing.
+2. Run `--sync` again and confirm the conflict settles to `0`.
+3. If it remains, inspect only redacted reminder metadata and source locations.
+4. Do not delete reminders automatically; decide which existing item is
+   authoritative before manual cleanup.
 
 ## Apple completion is not reflected in TaskForge
 

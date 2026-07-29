@@ -5,6 +5,9 @@ import TaskForgeReminderCore
 private enum RunMode {
     case checkConfig
     case dryRun
+    case audit
+    case deduplicateDryRun
+    case deduplicate
     case sync
     case reverseDryRun
     case reverseOnce
@@ -30,6 +33,12 @@ private struct Options {
                 options.mode = .checkConfig
             case "--dry-run":
                 options.mode = .dryRun
+            case "--audit":
+                options.mode = .audit
+            case "--deduplicate-dry-run":
+                options.mode = .deduplicateDryRun
+            case "--deduplicate":
+                options.mode = .deduplicate
             case "--sync":
                 options.mode = .sync
             case "--reverse-dry-run":
@@ -141,7 +150,8 @@ private struct TaskForgeReminderSyncCommand {
                 try checkConfig(options: options, calendar: calendar)
             case .dryRun:
                 try printPreview(options: options, calendar: calendar)
-            case .sync, .reverseDryRun, .reverseOnce, .watch:
+            case .audit, .deduplicateDryRun, .deduplicate,
+                 .sync, .reverseDryRun, .reverseOnce, .watch:
                 try await run(options: options, calendar: calendar)
             }
         } catch {
@@ -183,6 +193,34 @@ private struct TaskForgeReminderSyncCommand {
         try await engine.requestReminderAccess()
 
         switch options.mode {
+        case .audit:
+            let report = try await engine.auditReminderMappings()
+            printAudit(report)
+        case .deduplicateDryRun:
+            let counts = try await engine.deduplicateActiveReminders(
+                dryRun: true
+            )
+            print(
+                "去重预演：重复组 \(counts.duplicateGroups)，"
+                    + "保留 \(counts.preserved)，将归档 \(counts.archived)。"
+            )
+            print("预演模式：没有修改提醒事项。")
+        case .deduplicate:
+            let counts = try await engine.deduplicateActiveReminders(
+                dryRun: false
+            )
+            let forward = try await engine.forward()
+            let report = try await engine.auditReminderMappings()
+            print(
+                "去重完成：重复组 \(counts.duplicateGroups)，"
+                    + "保留 \(counts.preserved)，归档 \(counts.archived)。"
+            )
+            print("归档列表：\(options.listName) · 去重归档")
+            print(
+                "重新关联：\(forward.relinked)，更新 \(forward.updated)，"
+                    + "新建 \(forward.created)。"
+            )
+            printAudit(report)
         case .sync:
             let reverse = try await engine.reverse(
                 dryRun: false,
@@ -193,7 +231,8 @@ private struct TaskForgeReminderSyncCommand {
             print(
                 "双向同步完成：反向写入 \(reverse.written)，"
                     + "正向新建 \(forward.created)，更新 \(forward.updated)，"
-                    + "无需变化 \(forward.unchanged)。"
+                    + "重新关联 \(forward.relinked)，无需变化 \(forward.unchanged)，"
+                    + "冲突 \(forward.conflicts)。"
             )
         case .reverseDryRun:
             let counts = try await engine.reverse(
@@ -268,6 +307,9 @@ private struct TaskForgeReminderSyncCommand {
             用法：
               TaskForgeReminderSync --check-config [--date YYYY-MM-DD]
               TaskForgeReminderSync --dry-run [--date YYYY-MM-DD]
+              TaskForgeReminderSync --audit
+              TaskForgeReminderSync --deduplicate-dry-run
+              TaskForgeReminderSync --deduplicate
               TaskForgeReminderSync --sync [--task-id ID]
               TaskForgeReminderSync --reverse-dry-run [--task-id ID]
               TaskForgeReminderSync --reverse-once --task-id ID
@@ -280,11 +322,30 @@ private struct TaskForgeReminderSyncCommand {
               --task-id ID          只处理一个 TaskForge 任务
               --backup-root PATH    反向写入前的备份目录
               --dry-run             只列出今日任务，不请求权限（默认）
+              --audit               只读审计受管提醒中的重复 ID 与源位置
+              --deduplicate-dry-run  预演将保留和归档的重复提醒数量
+              --deduplicate          将冗余活跃提醒移到可恢复的归档列表
               --reverse-dry-run     预览 Apple 完成状态的反向写入
               --reverse-once        执行一次反向写入并等待 TaskForge 回读
               --sync                反向写入后再正向同步一次
               --watch               常驻近实时双向同步
             """
         )
+    }
+
+    private static func printAudit(_ report: TaskReminderAuditReport) {
+        print("受管提醒事项：\(report.managedReminderCount)")
+        print("重复 TaskForge ID 组：\(report.duplicateTaskIdentifierGroups)")
+        print(
+            "重复活跃源位置组："
+                + "\(report.duplicateActiveSourceIdentityGroups)"
+        )
+        print(
+            "重复历史任务实例组："
+                + "\(report.duplicateCompletedOccurrenceGroups)"
+        )
+        print("历史源位置复用组：\(report.historicalSourceReuseGroups)")
+        print("缺少可审计源身份：\(report.missingSourceIdentityCount)")
+        print("去重状态：\(report.isDuplicateFree ? "通过" : "发现冲突")")
     }
 }

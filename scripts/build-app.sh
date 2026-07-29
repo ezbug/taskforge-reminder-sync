@@ -5,6 +5,7 @@ SCRIPT_DIR=${0:A:h}
 PROJECT_ROOT=${SCRIPT_DIR:h}
 OUTPUT_DIR=${1:-"$PROJECT_ROOT/dist"}
 APP_PATH="$OUTPUT_DIR/TaskForgeReminderSync.app"
+TASKFORGE_SYNC_SIGNING_IDENTITY=${TASKFORGE_SYNC_CODESIGN_IDENTITY:--}
 
 swift build \
   --package-path "$PROJECT_ROOT" \
@@ -26,12 +27,15 @@ install -m 755 \
   "$BIN_DIR/TaskForgeReminderSync" \
   "$APP_PATH/Contents/MacOS/TaskForgeReminderSync"
 install -m 644 \
+  "$PROJECT_ROOT/Resources/TaskForgeReminderSyncLauncher" \
+  "$APP_PATH/Contents/Resources/TaskForgeReminderSyncLauncher"
+install -m 644 \
   "$PROJECT_ROOT/Resources/Info.plist" \
   "$APP_PATH/Contents/Info.plist"
 
 codesign \
   --force \
-  --sign - \
+  --sign "$TASKFORGE_SYNC_SIGNING_IDENTITY" \
   --identifier local.codex.taskforge-reminder-sync \
   "$APP_PATH"
 

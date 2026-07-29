@@ -1,6 +1,6 @@
 import Foundation
 
-public struct TaskForgeDay: Codable, Equatable, Sendable {
+public struct TaskForgeDay: Codable, Equatable, Hashable, Sendable {
     public let year: Int
     public let month: Int
     public let day: Int
@@ -371,6 +371,351 @@ public struct TaskSourceReference: Codable, Equatable, Sendable {
     }
 }
 
+public struct TaskSourceIdentity: Hashable, Sendable {
+    public let sourceType: String
+    public let filePath: String
+    public let lineNumber: Int?
+
+    public init?(task: TaskForgeTask) {
+        guard
+            let rawSourceType = task.sourceType?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ),
+            let rawFilePath = task.filePath?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ),
+            !rawSourceType.isEmpty,
+            !rawFilePath.isEmpty
+        else {
+            return nil
+        }
+
+        let normalizedSourceType = rawSourceType.lowercased()
+        let stableLineNumber: Int?
+        switch normalizedSourceType {
+        case "markdowninline":
+            guard let lineNumber = task.lineNumber, lineNumber > 0 else {
+                return nil
+            }
+            stableLineNumber = lineNumber
+        case "tasknotes":
+            stableLineNumber = nil
+        default:
+            return nil
+        }
+
+        sourceType = normalizedSourceType
+        filePath = URL(fileURLWithPath: rawFilePath).standardizedFileURL.path
+        lineNumber = stableLineNumber
+    }
+}
+
+public struct TaskReminderMatchRecord: Equatable, Sendable {
+    public let key: Int
+    public let taskIdentifier: String?
+    public let sourceIdentity: TaskSourceIdentity?
+    public let reminderIsCompleted: Bool
+    public let scheduledDay: TaskForgeDay?
+
+    public init(
+        key: Int,
+        taskIdentifier: String?,
+        sourceIdentity: TaskSourceIdentity?,
+        reminderIsCompleted: Bool = false,
+        scheduledDay: TaskForgeDay? = nil
+    ) {
+        self.key = key
+        self.taskIdentifier = taskIdentifier
+        self.sourceIdentity = sourceIdentity
+        self.reminderIsCompleted = reminderIsCompleted
+        self.scheduledDay = scheduledDay
+    }
+}
+
+public enum TaskReminderMatchResult: Equatable, Sendable {
+    case exact(Int)
+    case source(Int)
+    case none
+    case ambiguous
+}
+
+public enum TaskReminderMatchPolicy {
+    public static func select(
+        task: TaskForgeTask,
+        records: [TaskReminderMatchRecord],
+        claimedKeys: Set<Int>
+    ) -> TaskReminderMatchResult {
+        let available = records.filter { !claimedKeys.contains($0.key) }
+        let exact = available.filter {
+            $0.taskIdentifier == task.identifier
+        }
+        if exact.count == 1, let key = exact.first?.key {
+            return .exact(key)
+        }
+        if exact.count > 1 {
+            return .ambiguous
+        }
+
+        guard let sourceIdentity = TaskSourceIdentity(task: task) else {
+            return .none
+        }
+        let activeSameSource = available.filter {
+            $0.sourceIdentity == sourceIdentity && !$0.reminderIsCompleted
+        }
+        if
+            activeSameSource.count == 1,
+            let key = activeSameSource.first?.key
+        {
+            return .source(key)
+        }
+        if activeSameSource.count > 1 {
+            return .ambiguous
+        }
+
+        guard let scheduledDay = task.scheduled?.day else {
+            return .none
+        }
+        let completedSameOccurrence = available.filter {
+            $0.sourceIdentity == sourceIdentity
+                && $0.reminderIsCompleted
+                && $0.scheduledDay == scheduledDay
+        }
+        if
+            completedSameOccurrence.count == 1,
+            let key = completedSameOccurrence.first?.key
+        {
+            return .source(key)
+        }
+        if completedSameOccurrence.count > 1 {
+            return .ambiguous
+        }
+        return .none
+    }
+}
+
+public struct TaskReminderAuditRecord: Equatable, Sendable {
+    public let taskIdentifier: String
+    public let sourceIdentity: TaskSourceIdentity?
+    public let isCompleted: Bool
+    public let scheduledDay: TaskForgeDay?
+
+    public init(
+        taskIdentifier: String,
+        sourceIdentity: TaskSourceIdentity?,
+        isCompleted: Bool = false,
+        scheduledDay: TaskForgeDay? = nil
+    ) {
+        self.taskIdentifier = taskIdentifier
+        self.sourceIdentity = sourceIdentity
+        self.isCompleted = isCompleted
+        self.scheduledDay = scheduledDay
+    }
+}
+
+public struct TaskReminderAuditReport: Equatable, Sendable {
+    public let managedReminderCount: Int
+    public let duplicateTaskIdentifierGroups: Int
+    public let duplicateActiveSourceIdentityGroups: Int
+    public let duplicateCompletedOccurrenceGroups: Int
+    public let historicalSourceReuseGroups: Int
+    public let missingSourceIdentityCount: Int
+
+    public init(
+        managedReminderCount: Int,
+        duplicateTaskIdentifierGroups: Int,
+        duplicateActiveSourceIdentityGroups: Int,
+        duplicateCompletedOccurrenceGroups: Int,
+        historicalSourceReuseGroups: Int,
+        missingSourceIdentityCount: Int
+    ) {
+        self.managedReminderCount = managedReminderCount
+        self.duplicateTaskIdentifierGroups = duplicateTaskIdentifierGroups
+        self.duplicateActiveSourceIdentityGroups =
+            duplicateActiveSourceIdentityGroups
+        self.duplicateCompletedOccurrenceGroups =
+            duplicateCompletedOccurrenceGroups
+        self.historicalSourceReuseGroups = historicalSourceReuseGroups
+        self.missingSourceIdentityCount = missingSourceIdentityCount
+    }
+
+    public var isDuplicateFree: Bool {
+        duplicateTaskIdentifierGroups == 0
+            && duplicateActiveSourceIdentityGroups == 0
+            && duplicateCompletedOccurrenceGroups == 0
+    }
+}
+
+public enum TaskReminderAuditPolicy {
+    private struct CompletedOccurrence: Hashable {
+        let sourceIdentity: TaskSourceIdentity
+        let scheduledDay: TaskForgeDay?
+    }
+
+    public static func analyze(
+        _ records: [TaskReminderAuditRecord]
+    ) -> TaskReminderAuditReport {
+        var taskIdentifierCounts: [String: Int] = [:]
+        var activeSourceIdentityCounts: [TaskSourceIdentity: Int] = [:]
+        var completedOccurrenceCounts: [CompletedOccurrence: Int] = [:]
+        var recordsBySourceIdentity: [
+            TaskSourceIdentity: [TaskReminderAuditRecord]
+        ] = [:]
+        var missingSourceIdentityCount = 0
+
+        for record in records {
+            taskIdentifierCounts[record.taskIdentifier, default: 0] += 1
+            if let sourceIdentity = record.sourceIdentity {
+                recordsBySourceIdentity[sourceIdentity, default: []].append(
+                    record
+                )
+                if record.isCompleted {
+                    let occurrence = CompletedOccurrence(
+                        sourceIdentity: sourceIdentity,
+                        scheduledDay: record.scheduledDay
+                    )
+                    completedOccurrenceCounts[occurrence, default: 0] += 1
+                } else {
+                    activeSourceIdentityCounts[sourceIdentity, default: 0] += 1
+                }
+            } else {
+                missingSourceIdentityCount += 1
+            }
+        }
+
+        return TaskReminderAuditReport(
+            managedReminderCount: records.count,
+            duplicateTaskIdentifierGroups: taskIdentifierCounts.values.filter {
+                $0 > 1
+            }.count,
+            duplicateActiveSourceIdentityGroups:
+                activeSourceIdentityCounts.values.filter {
+                    $0 > 1
+                }.count,
+            duplicateCompletedOccurrenceGroups:
+                completedOccurrenceCounts.values.filter {
+                    $0 > 1
+                }.count,
+            historicalSourceReuseGroups: recordsBySourceIdentity.values.filter {
+                let scheduledDays = Set($0.compactMap(\.scheduledDay))
+                return scheduledDays.count > 1
+            }.count,
+            missingSourceIdentityCount: missingSourceIdentityCount
+        )
+    }
+}
+
+public struct TaskReminderDeduplicationRecord: Equatable, Sendable {
+    public let key: Int
+    public let taskIdentifier: String
+    public let sourceIdentity: TaskSourceIdentity?
+    public let creationTimestamp: TimeInterval
+
+    public init(
+        key: Int,
+        taskIdentifier: String,
+        sourceIdentity: TaskSourceIdentity?,
+        creationTimestamp: TimeInterval
+    ) {
+        self.key = key
+        self.taskIdentifier = taskIdentifier
+        self.sourceIdentity = sourceIdentity
+        self.creationTimestamp = creationTimestamp
+    }
+}
+
+public struct TaskReminderDeduplicationPlan: Equatable, Sendable {
+    public let duplicateGroups: Int
+    public let preservedKeys: [Int]
+    public let archiveKeys: [Int]
+
+    public init(
+        duplicateGroups: Int,
+        preservedKeys: [Int],
+        archiveKeys: [Int]
+    ) {
+        self.duplicateGroups = duplicateGroups
+        self.preservedKeys = preservedKeys
+        self.archiveKeys = archiveKeys
+    }
+}
+
+public enum TaskReminderDeduplicationPolicy {
+    public static func plan(
+        records: [TaskReminderDeduplicationRecord],
+        currentTaskIdentifiers: Set<String>
+    ) -> TaskReminderDeduplicationPlan {
+        var visited = Set<Int>()
+        var components: [[TaskReminderDeduplicationRecord]] = []
+
+        for startIndex in records.indices where !visited.contains(startIndex) {
+            var stack = [startIndex]
+            var componentIndices: [Int] = []
+            visited.insert(startIndex)
+            while let currentIndex = stack.popLast() {
+                componentIndices.append(currentIndex)
+                for candidateIndex in records.indices
+                    where !visited.contains(candidateIndex)
+                {
+                    if linked(records[currentIndex], records[candidateIndex]) {
+                        visited.insert(candidateIndex)
+                        stack.append(candidateIndex)
+                    }
+                }
+            }
+            if componentIndices.count > 1 {
+                components.append(componentIndices.map { records[$0] })
+            }
+        }
+
+        var preservedKeys: [Int] = []
+        var archiveKeys: [Int] = []
+        for component in components {
+            let ranked = component.sorted { first, second in
+                let firstIsCurrent = currentTaskIdentifiers.contains(
+                    first.taskIdentifier
+                )
+                let secondIsCurrent = currentTaskIdentifiers.contains(
+                    second.taskIdentifier
+                )
+                if firstIsCurrent != secondIsCurrent {
+                    return firstIsCurrent
+                }
+                if first.creationTimestamp != second.creationTimestamp {
+                    return first.creationTimestamp < second.creationTimestamp
+                }
+                return first.key < second.key
+            }
+            guard let preserved = ranked.first else {
+                continue
+            }
+            preservedKeys.append(preserved.key)
+            archiveKeys.append(contentsOf: ranked.dropFirst().map(\.key))
+        }
+
+        return TaskReminderDeduplicationPlan(
+            duplicateGroups: components.count,
+            preservedKeys: preservedKeys.sorted(),
+            archiveKeys: archiveKeys.sorted()
+        )
+    }
+
+    private static func linked(
+        _ first: TaskReminderDeduplicationRecord,
+        _ second: TaskReminderDeduplicationRecord
+    ) -> Bool {
+        if first.taskIdentifier == second.taskIdentifier {
+            return true
+        }
+        guard
+            let firstSource = first.sourceIdentity,
+            let secondSource = second.sourceIdentity
+        else {
+            return false
+        }
+        return firstSource == secondSource
+    }
+}
+
 public enum TaskCompletionSourceInspector {
     public static func isCompleted(
         task: TaskForgeTask,
@@ -442,6 +787,10 @@ public enum TaskCompletionEditorError: Error, LocalizedError, Equatable {
     case uncheckedCheckboxNotFound
     case invalidTaskNotesFrontmatter
     case taskNotesStatusNotFound
+
+    public var isSafeUnattendedSkip: Bool {
+        true
+    }
 
     public var errorDescription: String? {
         switch self {

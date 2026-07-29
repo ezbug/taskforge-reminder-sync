@@ -272,6 +272,315 @@ private let tests: [TestCase] = [
         try require(decoded.vaultPath == "/vault/中文", "unexpected decoded vault")
         try require(decoded.taskIdentifier == "task-42", "unexpected decoded task ID")
     }),
+    ("source identity survives TaskForge identifier and title changes", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let original = snapshot.tasks[0]
+        let changed = TaskForgeTask(
+            identifier: "task-reindexed",
+            title: "已改名的示例任务",
+            status: original.status,
+            priority: original.priority,
+            scheduled: original.scheduled,
+            filePath: original.filePath,
+            sourceType: original.sourceType,
+            originalLine: "- [ ] 已改名的示例任务",
+            lineNumber: original.lineNumber,
+            onCompletion: original.onCompletion,
+            recurrence: original.recurrence
+        )
+
+        try require(
+            TaskSourceIdentity(task: original) == TaskSourceIdentity(task: changed),
+            "same inline source coordinate must keep a stable identity"
+        )
+    }),
+    ("reminder matching reuses the same reminder after TaskForge reindexing", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let original = snapshot.tasks[0]
+        let changed = TaskForgeTask(
+            identifier: "task-reindexed",
+            title: "已改名的示例任务",
+            status: original.status,
+            priority: original.priority,
+            scheduled: original.scheduled,
+            filePath: original.filePath,
+            sourceType: original.sourceType,
+            originalLine: "- [ ] 已改名的示例任务",
+            lineNumber: original.lineNumber,
+            onCompletion: original.onCompletion,
+            recurrence: original.recurrence
+        )
+        let sourceIdentity = try requireValue(
+            TaskSourceIdentity(task: original),
+            "source identity should exist"
+        )
+        let records = [
+            TaskReminderMatchRecord(
+                key: 0,
+                taskIdentifier: original.identifier,
+                sourceIdentity: sourceIdentity
+            )
+        ]
+
+        try require(
+            TaskReminderMatchPolicy.select(
+                task: changed,
+                records: records,
+                claimedKeys: []
+            ) == .source(0),
+            "changed TaskForge ID should reuse the reminder at the same source"
+        )
+    }),
+    ("reminder matching refuses ambiguous source duplicates", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let task = snapshot.tasks[0]
+        let sourceIdentity = try requireValue(
+            TaskSourceIdentity(task: task),
+            "source identity should exist"
+        )
+        let records = [
+            TaskReminderMatchRecord(
+                key: 0,
+                taskIdentifier: "old-a",
+                sourceIdentity: sourceIdentity
+            ),
+            TaskReminderMatchRecord(
+                key: 1,
+                taskIdentifier: "old-b",
+                sourceIdentity: sourceIdentity
+            )
+        ]
+
+        try require(
+            TaskReminderMatchPolicy.select(
+                task: task,
+                records: records,
+                claimedKeys: []
+            ) == .ambiguous,
+            "ambiguous reminders must not create another duplicate"
+        )
+    }),
+    ("reminder matching ignores completed history from another occurrence", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let task = snapshot.tasks[0]
+        let sourceIdentity = try requireValue(
+            TaskSourceIdentity(task: task),
+            "source identity should exist"
+        )
+        let records = [
+            TaskReminderMatchRecord(
+                key: 0,
+                taskIdentifier: "historical-task",
+                sourceIdentity: sourceIdentity,
+                reminderIsCompleted: true,
+                scheduledDay: TaskForgeDay(year: 2026, month: 7, day: 25)
+            )
+        ]
+
+        try require(
+            TaskReminderMatchPolicy.select(
+                task: task,
+                records: records,
+                claimedKeys: []
+            ) == .none,
+            "a completed historical occurrence must not capture today's task"
+        )
+    }),
+    ("reminder matching retains a completed reminder for the same occurrence", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let task = snapshot.tasks[0]
+        let sourceIdentity = try requireValue(
+            TaskSourceIdentity(task: task),
+            "source identity should exist"
+        )
+        let records = [
+            TaskReminderMatchRecord(
+                key: 0,
+                taskIdentifier: "reindexed-task",
+                sourceIdentity: sourceIdentity,
+                reminderIsCompleted: true,
+                scheduledDay: task.scheduled?.day
+            )
+        ]
+
+        try require(
+            TaskReminderMatchPolicy.select(
+                task: task,
+                records: records,
+                claimedKeys: []
+            ) == .source(0),
+            "same-day completion should stay attached after reindexing"
+        )
+    }),
+    ("reminder audit counts duplicate marker and source groups", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let firstIdentity = try requireValue(
+            TaskSourceIdentity(task: snapshot.tasks[0]),
+            "first source identity should exist"
+        )
+        let secondIdentity = try requireValue(
+            TaskSourceIdentity(task: snapshot.tasks[1]),
+            "second source identity should exist"
+        )
+        let report = TaskReminderAuditPolicy.analyze([
+            TaskReminderAuditRecord(
+                taskIdentifier: "task-a",
+                sourceIdentity: firstIdentity
+            ),
+            TaskReminderAuditRecord(
+                taskIdentifier: "task-a",
+                sourceIdentity: firstIdentity
+            ),
+            TaskReminderAuditRecord(
+                taskIdentifier: "task-b",
+                sourceIdentity: secondIdentity
+            ),
+            TaskReminderAuditRecord(
+                taskIdentifier: "task-c",
+                sourceIdentity: nil
+            )
+        ])
+
+        try require(report.managedReminderCount == 4, "unexpected audit total")
+        try require(
+            report.duplicateTaskIdentifierGroups == 1,
+            "duplicate marker group should be reported"
+        )
+        try require(
+            report.duplicateActiveSourceIdentityGroups == 1,
+            "duplicate active source group should be reported"
+        )
+        try require(
+            report.missingSourceIdentityCount == 1,
+            "missing source reference should be reported"
+        )
+        try require(!report.isDuplicateFree, "duplicate audit must fail")
+    }),
+    ("reminder audit separates completed historical source reuse", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let sourceIdentity = try requireValue(
+            TaskSourceIdentity(task: snapshot.tasks[0]),
+            "source identity should exist"
+        )
+        let report = TaskReminderAuditPolicy.analyze([
+            TaskReminderAuditRecord(
+                taskIdentifier: "history-a",
+                sourceIdentity: sourceIdentity,
+                isCompleted: true,
+                scheduledDay: TaskForgeDay(year: 2026, month: 7, day: 25)
+            ),
+            TaskReminderAuditRecord(
+                taskIdentifier: "history-b",
+                sourceIdentity: sourceIdentity,
+                isCompleted: true,
+                scheduledDay: TaskForgeDay(year: 2026, month: 7, day: 26)
+            )
+        ])
+
+        try require(
+            report.duplicateActiveSourceIdentityGroups == 0,
+            "completed history must not count as an active duplicate"
+        )
+        try require(
+            report.duplicateCompletedOccurrenceGroups == 0,
+            "different scheduled days are different historical occurrences"
+        )
+        try require(
+            report.historicalSourceReuseGroups == 1,
+            "historical source reuse should remain visible"
+        )
+        try require(report.isDuplicateFree, "historical reuse should pass audit")
+    }),
+    ("deduplication plan preserves current exact reminder and archives extras", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let sourceIdentity = try requireValue(
+            TaskSourceIdentity(task: snapshot.tasks[0]),
+            "source identity should exist"
+        )
+        let plan = TaskReminderDeduplicationPolicy.plan(
+            records: [
+                TaskReminderDeduplicationRecord(
+                    key: 0,
+                    taskIdentifier: "stale-a",
+                    sourceIdentity: sourceIdentity,
+                    creationTimestamp: 10
+                ),
+                TaskReminderDeduplicationRecord(
+                    key: 1,
+                    taskIdentifier: "task-1",
+                    sourceIdentity: sourceIdentity,
+                    creationTimestamp: 20
+                ),
+                TaskReminderDeduplicationRecord(
+                    key: 2,
+                    taskIdentifier: "stale-b",
+                    sourceIdentity: sourceIdentity,
+                    creationTimestamp: 5
+                )
+            ],
+            currentTaskIdentifiers: ["task-1"]
+        )
+
+        try require(plan.duplicateGroups == 1, "unexpected duplicate group count")
+        try require(plan.preservedKeys == [1], "current exact reminder must win")
+        try require(plan.archiveKeys == [0, 2], "stale reminders should be archived")
+    }),
+    ("deduplication plan falls back to the oldest reminder", {
+        let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
+        let sourceIdentity = try requireValue(
+            TaskSourceIdentity(task: snapshot.tasks[0]),
+            "source identity should exist"
+        )
+        let plan = TaskReminderDeduplicationPolicy.plan(
+            records: [
+                TaskReminderDeduplicationRecord(
+                    key: 4,
+                    taskIdentifier: "stale-newer",
+                    sourceIdentity: sourceIdentity,
+                    creationTimestamp: 20
+                ),
+                TaskReminderDeduplicationRecord(
+                    key: 3,
+                    taskIdentifier: "stale-older",
+                    sourceIdentity: sourceIdentity,
+                    creationTimestamp: 10
+                )
+            ],
+            currentTaskIdentifiers: []
+        )
+
+        try require(plan.preservedKeys == [3], "oldest reminder should be preserved")
+        try require(plan.archiveKeys == [4], "newer duplicate should be archived")
+    }),
+    ("TaskNotes source identity ignores frontmatter line movement", {
+        let first = TaskForgeTask(
+            identifier: "note-a",
+            title: "任务笔记",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/TaskNotes/Tasks/note.md",
+            sourceType: "taskNotes",
+            originalLine: "tasknotes:{}",
+            lineNumber: 1
+        )
+        let moved = TaskForgeTask(
+            identifier: "note-b",
+            title: "任务笔记（改名）",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/TaskNotes/Tasks/note.md",
+            sourceType: "taskNotes",
+            originalLine: "tasknotes:{}",
+            lineNumber: 8
+        )
+
+        try require(
+            TaskSourceIdentity(task: first) == TaskSourceIdentity(task: moved),
+            "TaskNotes should be identified by its file, not a frontmatter line"
+        )
+    }),
     ("inline completion checks the exact source task and adds completion date", {
         let task = TaskForgeTask(
             identifier: "task-inline",
@@ -388,6 +697,10 @@ private let tests: [TestCase] = [
             throw TestFailure(description: "ambiguous source should be refused")
         } catch let error as TaskCompletionEditorError {
             try require(error == .sourceLineNotUnique, "unexpected stale-source reason")
+            try require(
+                error.isSafeUnattendedSkip,
+                "stale source refusal should be a non-failing unattended skip"
+            )
         }
     }),
     ("forward completion policy never reopens an Apple-completed reminder", {

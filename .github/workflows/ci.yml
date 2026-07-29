@@ -23,6 +23,9 @@ jobs:
           plutil -lint Resources/local.codex.taskforge-reminder-sync.plist
       - name: Validate shell scripts
         run: |
+          zsh -n Resources/TaskForgeReminderSyncLauncher
           zsh -n scripts/build-app.sh
           zsh -n scripts/install-daily-sync.sh
           zsh -n scripts/uninstall-daily-sync.sh
+      - name: Build and verify app bundle
+        run: ./scripts/build-app.sh

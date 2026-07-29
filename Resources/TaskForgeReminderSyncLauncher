@@ -1,0 +1,55 @@
+#!/bin/zsh
+set -euo pipefail
+
+APP_PATH=${0:A:h:h:h}
+SYNC_EXECUTABLE="$APP_PATH/Contents/MacOS/TaskForgeReminderSync"
+STDOUT_LOG="$HOME/Library/Logs/TaskForgeReminderSync.log"
+STDERR_LOG="$HOME/Library/Logs/TaskForgeReminderSync.error.log"
+watcher_pid=""
+
+find_watcher_pid() {
+  ps -axo pid=,command= | while read -r pid command; do
+    if [[ "$command" == "$SYNC_EXECUTABLE --watch" ]]; then
+      print -r -- "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stop_watcher() {
+  if [[ -n "$watcher_pid" ]] && kill -0 "$watcher_pid" 2>/dev/null; then
+    kill "$watcher_pid" 2>/dev/null || true
+  fi
+}
+
+trap stop_watcher EXIT INT TERM
+
+watcher_pid=$(find_watcher_pid || true)
+if [[ -z "$watcher_pid" ]]; then
+  /usr/bin/open \
+    -n \
+    -g \
+    -a "$APP_PATH" \
+    -o "$STDOUT_LOG" \
+    --stderr "$STDERR_LOG" \
+    --args --watch
+
+  for _ in {1..100}; do
+    watcher_pid=$(find_watcher_pid || true)
+    if [[ -n "$watcher_pid" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
+if [[ -z "$watcher_pid" ]]; then
+  print -u2 -r -- "无法确认 TaskForgeReminderSync --watch 进程。"
+  exit 1
+fi
+
+while kill -0 "$watcher_pid" 2>/dev/null; do
+  sleep 5
+done
+watcher_pid=""

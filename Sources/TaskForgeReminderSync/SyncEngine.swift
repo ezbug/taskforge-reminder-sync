@@ -59,7 +59,9 @@ enum SyncError: Error, LocalizedError {
 struct ForwardCounts {
     var created = 0
     var updated = 0
+    var relinked = 0
     var unchanged = 0
+    var conflicts = 0
 }
 
 struct ReverseCounts {
@@ -67,6 +69,12 @@ struct ReverseCounts {
     var written = 0
     var skipped = 0
     var failed = 0
+}
+
+struct DeduplicationCounts {
+    var duplicateGroups = 0
+    var preserved = 0
+    var archived = 0
 }
 
 struct TaskSourceWriteReceipt {
@@ -184,10 +192,13 @@ final class SyncEngine {
 
     func requestReminderAccess() async throws {
         let status = EKEventStore.authorizationStatus(for: .reminder)
+        log("提醒事项权限状态：\(status.rawValue)")
         if #available(macOS 14.0, *), status == .fullAccess {
+            log("提醒事项权限：完整访问")
             return
         }
         if #unavailable(macOS 14.0), status == .authorized {
+            log("提醒事项权限：已授权")
             return
         }
 
@@ -208,6 +219,104 @@ final class SyncEngine {
         guard granted else {
             throw SyncError.accessDenied
         }
+        log("提醒事项权限请求：已批准")
+    }
+
+    func auditReminderMappings() async throws -> TaskReminderAuditReport {
+        let snapshot = try loadSnapshotWithRetry()
+        guard
+            let reminderCalendar = store.calendars(for: .reminder)
+                .first(where: { $0.title == configuration.listName })
+        else {
+            return TaskReminderAuditPolicy.analyze([])
+        }
+        let reminders = await fetchReminders(in: reminderCalendar)
+        let records = reminders.compactMap {
+            reminder -> TaskReminderAuditRecord? in
+            guard
+                let marker = TaskSyncMarker.extract(from: reminder.notes),
+                let decoded = TaskSyncMarker.decode(marker),
+                decoded.vaultPath == snapshot.vaultPath
+            else {
+                return nil
+            }
+            let sourceReference = TaskSourceReference.decode(
+                from: reminder.notes
+            )
+            let sourceIdentity = sourceReference.flatMap {
+                TaskSourceIdentity(task: $0.task)
+            }
+            return TaskReminderAuditRecord(
+                taskIdentifier: decoded.taskIdentifier,
+                sourceIdentity: sourceIdentity,
+                isCompleted: reminder.isCompleted,
+                scheduledDay: sourceReference?.task.scheduled?.day
+            )
+        }
+        return TaskReminderAuditPolicy.analyze(records)
+    }
+
+    func deduplicateActiveReminders(
+        dryRun: Bool
+    ) async throws -> DeduplicationCounts {
+        let snapshot = try loadSnapshotWithRetry()
+        guard
+            let reminderCalendar = store.calendars(for: .reminder)
+                .first(where: { $0.title == configuration.listName })
+        else {
+            return DeduplicationCounts()
+        }
+        let reminders = await fetchReminders(in: reminderCalendar)
+        let records = reminders.enumerated().compactMap {
+            index, reminder -> TaskReminderDeduplicationRecord? in
+            guard
+                !reminder.isCompleted,
+                let marker = TaskSyncMarker.extract(from: reminder.notes),
+                let decoded = TaskSyncMarker.decode(marker),
+                decoded.vaultPath == snapshot.vaultPath
+            else {
+                return nil
+            }
+            let sourceIdentity = TaskSourceReference.decode(
+                from: reminder.notes
+            ).flatMap {
+                TaskSourceIdentity(task: $0.task)
+            }
+            return TaskReminderDeduplicationRecord(
+                key: index,
+                taskIdentifier: decoded.taskIdentifier,
+                sourceIdentity: sourceIdentity,
+                creationTimestamp: reminder.creationDate?
+                    .timeIntervalSince1970
+                    ?? .greatestFiniteMagnitude
+            )
+        }
+        let plan = TaskReminderDeduplicationPolicy.plan(
+            records: records,
+            currentTaskIdentifiers: Set(snapshot.tasks.map(\.identifier))
+        )
+        let counts = DeduplicationCounts(
+            duplicateGroups: plan.duplicateGroups,
+            preserved: plan.preservedKeys.count,
+            archived: plan.archiveKeys.count
+        )
+        guard !dryRun, !plan.archiveKeys.isEmpty else {
+            return counts
+        }
+
+        let archiveCalendar = try findOrCreateArchiveCalendar(
+            source: reminderCalendar.source
+        )
+        for key in plan.archiveKeys {
+            reminders[key].calendar = archiveCalendar
+            try store.save(reminders[key], commit: false)
+        }
+        try store.commit()
+        log(
+            "去重归档：重复组 \(counts.duplicateGroups)，"
+                + "保留 \(counts.preserved)，归档 \(counts.archived)"
+        )
+        return counts
     }
 
     func reverse(
@@ -305,6 +414,13 @@ final class SyncEngine {
                     timeoutSeconds: 15
                 )
                 log("  TaskForge 回读：done")
+            } catch let error as TaskCompletionEditorError
+                where error.isSafeUnattendedSkip
+            {
+                counts.skipped += 1
+                if requireCandidate {
+                    throw error
+                }
             } catch {
                 counts.failed += 1
                 logError("反向跳过 \(task.title)：\(error.localizedDescription)")
@@ -327,32 +443,91 @@ final class SyncEngine {
         let todayTasks = snapshot.openTasksScheduled(on: requestedDay)
         let reminderCalendar = try findOrCreateReminderCalendar()
         let existing = await fetchReminders(in: reminderCalendar)
-        let existingByMarker = Dictionary(
-            existing.compactMap { reminder -> (String, EKReminder)? in
-                guard let marker = TaskSyncMarker.extract(from: reminder.notes) else {
-                    return nil
-                }
-                return (marker, reminder)
-            },
-            uniquingKeysWith: { first, _ in first }
-        )
+        let matchRecords = existing.enumerated().compactMap {
+            index, reminder -> TaskReminderMatchRecord? in
+            guard
+                let marker = TaskSyncMarker.extract(from: reminder.notes),
+                let decoded = TaskSyncMarker.decode(marker),
+                decoded.vaultPath == snapshot.vaultPath
+            else {
+                return nil
+            }
+            let sourceReference = TaskSourceReference.decode(
+                from: reminder.notes
+            )
+            let sourceIdentity = sourceReference.flatMap {
+                TaskSourceIdentity(task: $0.task)
+            }
+            return TaskReminderMatchRecord(
+                key: index,
+                taskIdentifier: decoded.taskIdentifier,
+                sourceIdentity: sourceIdentity,
+                reminderIsCompleted: reminder.isCompleted,
+                scheduledDay: sourceReference?.task.scheduled?.day
+            )
+        }
         let todayIdentifiers = Set(todayTasks.map(\.identifier))
 
         var counts = ForwardCounts()
+        var claimedReminderKeys = Set<Int>()
+        var processedTaskIdentifiers = Set<String>()
+        var processedSourceIdentities = Set<TaskSourceIdentity>()
         for task in snapshot.tasks {
             let marker = TaskSyncMarker.make(
                 vaultPath: snapshot.vaultPath,
                 taskIdentifier: task.identifier
             )
-            let existingReminder = existingByMarker[marker]
-            guard todayIdentifiers.contains(task.identifier) || existingReminder != nil else {
+            let match = TaskReminderMatchPolicy.select(
+                task: task,
+                records: matchRecords,
+                claimedKeys: claimedReminderKeys
+            )
+            let matchedKey: Int?
+            let wasRelinked: Bool
+            switch match {
+            case let .exact(key):
+                matchedKey = key
+                wasRelinked = false
+            case let .source(key):
+                matchedKey = key
+                wasRelinked = true
+            case .none:
+                matchedKey = nil
+                wasRelinked = false
+            case .ambiguous:
+                counts.conflicts += 1
+                logError(
+                    "正向去重冲突 \(task.title)：存在多个同一 TaskForge ID 或源位置的提醒事项，"
+                        + "已拒绝新建。"
+                )
                 continue
             }
 
+            guard todayIdentifiers.contains(task.identifier) || matchedKey != nil else {
+                continue
+            }
+            let sourceIdentity = TaskSourceIdentity(task: task)
+            guard processedTaskIdentifiers.insert(task.identifier).inserted else {
+                counts.conflicts += 1
+                logError("正向去重冲突 \(task.title)：任务库中存在重复 TaskForge ID，已拒绝新建。")
+                continue
+            }
+            if
+                let sourceIdentity,
+                !processedSourceIdentities.insert(sourceIdentity).inserted
+            {
+                counts.conflicts += 1
+                logError("正向去重冲突 \(task.title)：任务库中存在重复源位置，已拒绝新建。")
+                continue
+            }
+
+            let existingReminder = matchedKey.map { existing[$0] }
             let reminder = existingReminder ?? EKReminder(eventStore: store)
-            let isNew = existingReminder == nil
+            let isNew = matchedKey == nil
             if isNew {
                 reminder.calendar = reminderCalendar
+            } else if let matchedKey {
+                claimedReminderKeys.insert(matchedKey)
             }
             let changed = apply(task: task, marker: marker, to: reminder)
             if changed || isNew {
@@ -361,6 +536,9 @@ final class SyncEngine {
                     counts.created += 1
                 } else {
                     counts.updated += 1
+                    if wasRelinked {
+                        counts.relinked += 1
+                    }
                 }
             } else {
                 counts.unchanged += 1
@@ -372,7 +550,8 @@ final class SyncEngine {
         }
         log(
             "正向同步：新建 \(counts.created)，更新 \(counts.updated)，"
-                + "无需变化 \(counts.unchanged)"
+                + "重新关联 \(counts.relinked)，无需变化 \(counts.unchanged)，"
+                + "冲突 \(counts.conflicts)"
         )
         return counts
     }
@@ -555,6 +734,23 @@ final class SyncEngine {
         reminderCalendar.source = source
         try store.saveCalendar(reminderCalendar, commit: true)
         return reminderCalendar
+    }
+
+    private func findOrCreateArchiveCalendar(
+        source: EKSource
+    ) throws -> EKCalendar {
+        let archiveName = "\(configuration.listName) · 去重归档"
+        if
+            let existing = store.calendars(for: .reminder)
+                .first(where: { $0.title == archiveName })
+        {
+            return existing
+        }
+        let archiveCalendar = EKCalendar(for: .reminder, eventStore: store)
+        archiveCalendar.title = archiveName
+        archiveCalendar.source = source
+        try store.saveCalendar(archiveCalendar, commit: true)
+        return archiveCalendar
     }
 
     private func fetchReminders(in reminderCalendar: EKCalendar) async -> [EKReminder] {

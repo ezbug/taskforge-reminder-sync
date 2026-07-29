@@ -28,7 +28,7 @@ install -m 644 \
   "$LAUNCH_AGENT"
 
 /usr/libexec/PlistBuddy \
-  -c "Set :ProgramArguments:0 $INSTALLED_APP/Contents/MacOS/TaskForgeReminderSync" \
+  -c "Set :ProgramArguments:1 $INSTALLED_APP/Contents/Resources/TaskForgeReminderSyncLauncher" \
   "$LAUNCH_AGENT"
 plutil -replace StandardOutPath \
   -string "$LOG_DIR/TaskForgeReminderSync.log" \
