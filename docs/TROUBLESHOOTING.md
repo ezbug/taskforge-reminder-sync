@@ -112,6 +112,8 @@ candidate ledger, backup directory, hash salt or reminders. To advance state,
 use `--prune-once`, `--sync`, or let `--watch` complete another reconciliation.
 This also means dry-run never fixes an old `0755` runtime root: it reports an
 anonymous permission failure until a normal mutating run safely migrates it.
+`PruneHashSalt` is lazy state and may still be absent after a successful first
+candidate-registration pass; it is not an installation-health check by itself.
 
 ## Pruning reports an ambiguous list
 

@@ -64,6 +64,29 @@ public enum PrivateRuntimeDirectory {
         rootURL: URL,
         treeURL: URL
     ) throws {
+        try prepareRootAndKnownTree(
+            rootURL: rootURL,
+            treeURL: treeURL,
+            createTreeIfMissing: true
+        )
+    }
+
+    public static func prepareRootAndExistingKnownTree(
+        rootURL: URL,
+        treeURL: URL
+    ) throws {
+        try prepareRootAndKnownTree(
+            rootURL: rootURL,
+            treeURL: treeURL,
+            createTreeIfMissing: false
+        )
+    }
+
+    private static func prepareRootAndKnownTree(
+        rootURL: URL,
+        treeURL: URL,
+        createTreeIfMissing: Bool
+    ) throws {
         let root = rootURL.standardizedFileURL
         let tree = treeURL.standardizedFileURL
         guard tree.deletingLastPathComponent() == root else {
@@ -72,7 +95,9 @@ public enum PrivateRuntimeDirectory {
 
         guard let rootSnapshot = try snapshotIfPresent(at: root) else {
             try createDirectoryIncludingParents(at: root)
-            try createPrivateDirectory(at: tree)
+            if createTreeIfMissing {
+                try createPrivateDirectory(at: tree)
+            }
             return
         }
         try validateMigratable(rootSnapshot, expectedKind: .directory)
@@ -95,7 +120,7 @@ public enum PrivateRuntimeDirectory {
 
         // Validate the complete known tree before changing any existing mode.
         try migrate(rootSnapshot, to: 0o700)
-        if treeSnapshots.isEmpty {
+        if treeSnapshots.isEmpty && createTreeIfMissing {
             try createPrivateDirectory(at: tree)
         } else {
             for snapshot in treeSnapshots.sorted(by: migrationOrder) {

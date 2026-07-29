@@ -512,6 +512,8 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
 
     private let fileManager = FileManager.default
     private static let saltSetupLock = NSLock()
+    private let runtimePreparationLock = NSLock()
+    private var runtimePrepared = false
 
     private var encoder: JSONEncoder {
         let encoder = JSONEncoder()
@@ -610,7 +612,23 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     private func ensureDirectory(_ url: URL) throws {
         do {
             if url.standardizedFileURL == rootURL.standardizedFileURL {
-                try PrivateRuntimeDirectory.prepareRoot(at: url)
+                runtimePreparationLock.lock()
+                defer { runtimePreparationLock.unlock() }
+                if runtimePrepared {
+                    try PrivateRuntimeDirectory.validatePrivateDirectory(
+                        at: rootURL
+                    )
+                } else {
+                    try PrivateRuntimeDirectory
+                        .prepareRootAndExistingKnownTree(
+                            rootURL: rootURL,
+                            treeURL: rootURL.appendingPathComponent(
+                                "Backups",
+                                isDirectory: true
+                            )
+                        )
+                    runtimePrepared = true
+                }
             } else if try attributesIfItemExists(at: url) == nil {
                 try PrivateRuntimeDirectory.createPrivateDirectory(at: url)
             } else {

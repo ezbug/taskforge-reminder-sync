@@ -158,6 +158,8 @@ The parent directory is `0700`; ledger, backups and salt are `0600`. Writes use
 temporary files and atomic replacement. The salt produces truncated hashes for
 anonymous item correlation; logs contain counts, hashed identifiers and error
 categories, never reminder content, source paths or raw identifiers.
+The salt is created lazily when per-item anonymous correlation is first needed;
+a successful first candidate-registration pass may only create the ledger.
 
 ## Restore flow
 

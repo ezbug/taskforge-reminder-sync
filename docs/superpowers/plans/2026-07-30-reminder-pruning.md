@@ -1526,6 +1526,9 @@ git commit -m "docs(清理): 说明自动删除和恢复边界"
 - 现有 `Backups` 只按已知树迁移；必须全部是本人拥有的真实目录或普通
   文件、无扩展 ACL、且 group/world 不可写。整棵树先验证再改权限，异常
   一律失败关闭，不删除或改写备份内容。
+- 所有非只读 prune store 初始化都会迁移已经存在的 `Backups` 已知树；
+  `Backups` 不存在时不为 prune 空跑创建它。`PruneHashSalt` 同样按需生成，
+  首次只登记候选的成功扫描不要求它存在。
 - watcher 无限循环本轮不新增伪造的直接测试：协调顺序由
   `reconcile(reason:)` 固定为 reverse → forward → prune，prune 的候选撤销、
   日历变化、双扫描与恢复宽限由状态机测试直接覆盖，运行模式由进程级 CLI

@@ -1,4 +1,5 @@
 import CoreLocation
+import CryptoKit
 import Dispatch
 import Darwin
 import EventKit
@@ -151,6 +152,112 @@ private func permissions(at url: URL) throws -> Int {
         "permissions missing for \(url.lastPathComponent)"
     )
     return value.intValue & 0o777
+}
+
+private struct LegacySourceBackupFixture {
+    let backupsRoot: URL
+    let directories: [URL]
+    let files: [URL]
+}
+
+private struct RuntimeTreeEvidence: Equatable {
+    var directoryCount = 0
+    var fileCount = 0
+    var fileHashes: [String: String] = [:]
+}
+
+private func makeLegacySourceBackupFixture(
+    root: URL,
+    rootPermissions: Int
+) throws -> LegacySourceBackupFixture {
+    let backups = root.appendingPathComponent("Backups", isDirectory: true)
+    let batchA = backups.appendingPathComponent("batch-a", isDirectory: true)
+    let nested = batchA.appendingPathComponent("nested", isDirectory: true)
+    let batchB = backups.appendingPathComponent("batch-b", isDirectory: true)
+    let batchC = backups.appendingPathComponent("batch-c", isDirectory: true)
+    let directories = [root, backups, batchA, nested, batchB, batchC]
+    try FileManager.default.createDirectory(
+        at: nested,
+        withIntermediateDirectories: true
+    )
+    try FileManager.default.createDirectory(
+        at: batchB,
+        withIntermediateDirectories: false
+    )
+    try FileManager.default.createDirectory(
+        at: batchC,
+        withIntermediateDirectories: false
+    )
+    for directory in directories {
+        try FileManager.default.setAttributes(
+            [
+                .posixPermissions:
+                    directory == root ? rootPermissions : 0o755
+            ],
+            ofItemAtPath: directory.path
+        )
+    }
+
+    let files = [
+        backups.appendingPathComponent("manifest.bak"),
+        batchA.appendingPathComponent("one.bak"),
+        nested.appendingPathComponent("two.bak"),
+        batchB.appendingPathComponent("three.bak"),
+        batchC.appendingPathComponent("four.bak")
+    ]
+    for (index, file) in files.enumerated() {
+        try Data("legacy-\(index)".utf8).write(to: file)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: file.path
+        )
+    }
+    return LegacySourceBackupFixture(
+        backupsRoot: backups,
+        directories: directories,
+        files: files
+    )
+}
+
+private func runtimeTreeEvidence(at root: URL) throws
+    -> RuntimeTreeEvidence
+{
+    var evidence = RuntimeTreeEvidence()
+
+    func visit(_ url: URL) throws {
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else {
+            throw TestFailure(
+                description: "could not inspect \(url.lastPathComponent)"
+            )
+        }
+        switch status.st_mode & S_IFMT {
+        case S_IFDIR:
+            evidence.directoryCount += 1
+            let children = try FileManager.default.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: nil
+            )
+            for child in children.sorted(by: { $0.path < $1.path }) {
+                try visit(child)
+            }
+        case S_IFREG:
+            evidence.fileCount += 1
+            let relative = String(
+                url.path.dropFirst(root.path.count)
+            )
+            evidence.fileHashes[relative] = SHA256.hash(
+                data: try Data(contentsOf: url)
+            ).map { String(format: "%02x", $0) }.joined()
+        default:
+            throw TestFailure(
+                description: "unexpected node in evidence tree"
+            )
+        }
+    }
+
+    try visit(root)
+    return evidence
 }
 
 private var shanghaiCalendar: Calendar {
@@ -2112,6 +2219,12 @@ private let tests: [TestCase] = [
             try permissions(at: root) == 0o700,
             "normal load did not migrate the root to 0700"
         )
+        try require(
+            !FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("Backups").path
+            ),
+            "prune initialization created an unused source backup tree"
+        )
     }),
     ("unresolved selection chooses the newest unresolved outcome", {
         let root = FileManager.default.temporaryDirectory
@@ -2692,6 +2805,194 @@ private let tests: [TestCase] = [
                 "\(file.lastPathComponent) must be 0600"
             )
         }
+    }),
+    ("prune store migrates an existing backup tree under a private root", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeLegacySourceBackupFixture(
+            root: root,
+            rootPermissions: 0o700
+        )
+        let before = try runtimeTreeEvidence(at: root)
+        try require(
+            before.directoryCount == 6 && before.fileCount == 5,
+            "legacy fixture does not match production tree shape"
+        )
+
+        try require(
+            try ReminderPruneLocalStore(rootURL: root).loadLedger()
+                == ReminderPruneLedger(),
+            "normal prune load should preserve an absent ledger"
+        )
+        let after = try runtimeTreeEvidence(at: root)
+
+        try require(
+            after == before,
+            "prune initialization changed backup count or content hashes"
+        )
+        for directory in fixture.directories {
+            try require(
+                try permissions(at: directory) == 0o700,
+                "\(directory.lastPathComponent) was not migrated to 0700"
+            )
+        }
+        for file in fixture.files {
+            try require(
+                try permissions(at: file) == 0o600,
+                "\(file.lastPathComponent) was not migrated to 0600"
+            )
+        }
+    }),
+    ("prune store migrates an exposed root and its complete backup tree", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeLegacySourceBackupFixture(
+            root: root,
+            rootPermissions: 0o755
+        )
+        let before = try runtimeTreeEvidence(at: fixture.backupsRoot)
+        let store = ReminderPruneLocalStore(rootURL: root)
+
+        try store.saveLedger(ReminderPruneLedger())
+        try require(
+            try store.loadLedger() == ReminderPruneLedger(),
+            "normal prune save did not preserve the ledger"
+        )
+        let after = try runtimeTreeEvidence(at: fixture.backupsRoot)
+
+        try require(
+            after == before,
+            "full migration changed backup count or content hashes"
+        )
+        for directory in fixture.directories {
+            try require(
+                try permissions(at: directory) == 0o700,
+                "\(directory.lastPathComponent) was not private"
+            )
+        }
+        for file in fixture.files {
+            try require(
+                try permissions(at: file) == 0o600,
+                "\(file.lastPathComponent) was not private"
+            )
+        }
+        try require(
+            try permissions(at: store.ledgerURL) == 0o600,
+            "prune save did not create a private ledger"
+        )
+    }),
+    ("prune store fails closed for an unsafe existing backup tree", {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+
+        let writableRoot = container.appendingPathComponent(
+            "writable",
+            isDirectory: true
+        )
+        let writableFixture = try makeLegacySourceBackupFixture(
+            root: writableRoot,
+            rootPermissions: 0o700
+        )
+        let writableBefore = try runtimeTreeEvidence(at: writableRoot)
+        let writableFile = writableFixture.files[0]
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o660],
+            ofItemAtPath: writableFile.path
+        )
+
+        do {
+            _ = try ReminderPruneLocalStore(rootURL: writableRoot)
+                .loadLedger()
+            throw TestFailure(
+                description: "group-writable backup tree was accepted"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .permissions,
+                "unexpected writable-tree error"
+            )
+        }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: writableFile.path
+        )
+        try require(
+            try runtimeTreeEvidence(at: writableRoot) == writableBefore,
+            "failed migration changed writable-tree content"
+        )
+        try require(
+            try permissions(at: writableFixture.backupsRoot) == 0o755,
+            "failed migration partially changed directory modes"
+        )
+
+        let symlinkRoot = container.appendingPathComponent(
+            "symlink",
+            isDirectory: true
+        )
+        let symlinkFixture = try makeLegacySourceBackupFixture(
+            root: symlinkRoot,
+            rootPermissions: 0o700
+        )
+        let external = container.appendingPathComponent("external.bak")
+        let linked = symlinkFixture.backupsRoot
+            .appendingPathComponent("linked.bak")
+        try Data("external".utf8).write(to: external)
+        try FileManager.default.createSymbolicLink(
+            at: linked,
+            withDestinationURL: external
+        )
+
+        do {
+            _ = try ReminderPruneLocalStore(rootURL: symlinkRoot).loadLedger()
+            throw TestFailure(
+                description: "symlinked backup tree was accepted"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .permissions,
+                "unexpected symlink-tree error"
+            )
+        }
+        try require(
+            try Data(contentsOf: external) == Data("external".utf8),
+            "failed migration changed the symlink target"
+        )
+        try require(
+            try permissions(at: symlinkFixture.backupsRoot) == 0o755,
+            "symlink rejection partially changed directory modes"
+        )
+    }),
+    ("prune dry-run leaves an exposed backup tree unchanged", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeLegacySourceBackupFixture(
+            root: root,
+            rootPermissions: 0o700
+        )
+        let before = try runtimeTreeEvidence(at: root)
+
+        try require(
+            try ReminderPruneLocalStore(rootURL: root).loadLedgerReadOnly()
+                == ReminderPruneLedger(),
+            "dry-run should ignore an unrelated source backup tree"
+        )
+
+        try require(
+            try runtimeTreeEvidence(at: root) == before,
+            "dry-run changed backup count or content hashes"
+        )
+        try require(
+            try permissions(at: fixture.backupsRoot) == 0o755,
+            "dry-run changed source backup directory permissions"
+        )
+        try require(
+            try permissions(at: fixture.files[0]) == 0o644,
+            "dry-run changed source backup file permissions"
+        )
     }),
     ("runtime migration policy rejects a different owner", {
         let metadata = PrivateRuntimeNodeSecurity(
