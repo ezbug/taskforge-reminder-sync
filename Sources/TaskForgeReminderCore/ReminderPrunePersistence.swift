@@ -261,27 +261,66 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         }
 
         let data = try readData(at: url, error: .invalidBackup)
-        let envelope: BackupEnvelope
+        let hasSchemaVersion: Bool
         do {
-            envelope = try decoder.decode(BackupEnvelope.self, from: data)
+            guard
+                let root = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                let payload = root["payload"] as? [String: Any]
+            else {
+                throw ReminderPruneStoreError.checksumMismatch
+            }
+            hasSchemaVersion = payload["backupSchemaVersion"] != nil
+        } catch let error as ReminderPruneStoreError {
+            throw error
         } catch {
             throw ReminderPruneStoreError.checksumMismatch
         }
 
-        let payload: Data
-        do {
-            payload = try encoder.encode(envelope.payload)
-        } catch {
-            throw ReminderPruneStoreError.invalidBackup
+        let batch: ReminderPruneBackupBatch
+        if hasSchemaVersion {
+            let envelope: BackupEnvelope
+            do {
+                envelope = try decoder.decode(BackupEnvelope.self, from: data)
+            } catch {
+                throw ReminderPruneStoreError.checksumMismatch
+            }
+            let payload: Data
+            do {
+                payload = try encoder.encode(envelope.payload)
+            } catch {
+                throw ReminderPruneStoreError.invalidBackup
+            }
+            guard envelope.checksum == checksum(for: payload) else {
+                throw ReminderPruneStoreError.checksumMismatch
+            }
+            batch = envelope.payload
+        } else {
+            let legacy: LegacyBackupEnvelopeV1
+            do {
+                legacy = try decoder.decode(
+                    LegacyBackupEnvelopeV1.self,
+                    from: data
+                )
+            } catch {
+                throw ReminderPruneStoreError.checksumMismatch
+            }
+            let legacyPayload: Data
+            do {
+                legacyPayload = try encoder.encode(legacy.payload)
+            } catch {
+                throw ReminderPruneStoreError.invalidBackup
+            }
+            guard legacy.checksum == checksum(for: legacyPayload) else {
+                throw ReminderPruneStoreError.checksumMismatch
+            }
+            batch = legacy.payload.migrated()
         }
-        guard envelope.checksum == checksum(for: payload) else {
-            throw ReminderPruneStoreError.checksumMismatch
-        }
-        guard isValidBackup(envelope.payload) else {
+        guard isValidBackup(batch) else {
             throw ReminderPruneStoreError.invalidBackup
         }
         try ensurePrivateFile(url)
-        return envelope.payload
+        return batch
     }
 
     public func latestUnrestoredBackup() throws -> (URL, ReminderPruneBackupBatch)? {
@@ -672,20 +711,64 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
 }
 
 public final class ReminderPruneOperationFileLock: @unchecked Sendable {
-    public init(
-        exclusive: Bool,
-        anchorURL: URL = URL(
-            fileURLWithPath: "/tmp",
+    public static func defaultAnchorURL() throws -> URL {
+        let fileManager = FileManager.default
+        let home = URL(
+            fileURLWithPath: NSHomeDirectory(),
             isDirectory: true
         )
+        var candidates = [fileManager.temporaryDirectory]
+        if let caches = fileManager.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first {
+            candidates.append(caches)
+        }
+        candidates.append(
+            home.appendingPathComponent(
+                "Library/Caches",
+                isDirectory: true
+            )
+        )
+        candidates.append(
+            home.appendingPathComponent("Library", isDirectory: true)
+        )
+        candidates.append(home)
+        for candidate in candidates {
+            if let validated = validatedAnchor(candidate) {
+                return validated
+            }
+        }
+        throw ReminderPruneStoreError.permissions
+    }
+
+    public init(
+        exclusive: Bool,
+        anchorURL: URL? = nil
     ) throws {
-        let path = anchorURL.standardizedFileURL
-            .resolvingSymlinksInPath().path
+        let anchor: URL
+        if let anchorURL {
+            guard let validated = Self.validatedAnchor(anchorURL) else {
+                throw ReminderPruneStoreError.permissions
+            }
+            anchor = validated
+        } else {
+            anchor = try Self.defaultAnchorURL()
+        }
         let opened = open(
-            path,
+            anchor.path,
             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY
         )
         guard opened >= 0 else {
+            throw ReminderPruneStoreError.permissions
+        }
+        var status = stat()
+        guard
+            fstat(opened, &status) == 0,
+            status.st_uid == getuid(),
+            status.st_mode & S_IFMT == S_IFDIR
+        else {
+            _ = close(opened)
             throw ReminderPruneStoreError.permissions
         }
         let operation = exclusive ? LOCK_EX : LOCK_SH
@@ -714,9 +797,62 @@ public final class ReminderPruneOperationFileLock: @unchecked Sendable {
     }
 
     private var descriptor: Int32?
+
+    private static func validatedAnchor(_ url: URL) -> URL? {
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolved.path != "/tmp", resolved.path != "/private/tmp" else {
+            return nil
+        }
+        var status = stat()
+        guard
+            lstat(resolved.path, &status) == 0,
+            status.st_uid == getuid(),
+            status.st_mode & S_IFMT == S_IFDIR
+        else {
+            return nil
+        }
+        return resolved
+    }
 }
 
 private struct BackupEnvelope: Codable {
     let checksum: String
     let payload: ReminderPruneBackupBatch
+}
+
+private struct LegacyBackupEnvelopeV1: Codable {
+    let checksum: String
+    let payload: LegacyReminderPruneBackupBatchV1
+}
+
+private struct LegacyReminderPruneBackupBatchV1: Codable {
+    let identifier: UUID
+    let createdAt: Date
+    let targetCalendarIdentifier: String
+    let targetCalendarTitle: String
+    let targetSourceIdentifier: String
+    let rulesVersion: Int
+    let items: [ReminderPruneBackupItem]
+    let actuallyDeletedIdentifiers: [String]?
+    let restoreAttemptIdentifier: UUID?
+    let restoredItemIdentifiers: [String: String]
+    let restoredAt: Date?
+
+    func migrated() -> ReminderPruneBackupBatch {
+        ReminderPruneBackupBatch(
+            identifier: identifier,
+            createdAt: createdAt,
+            targetCalendarIdentifier: targetCalendarIdentifier,
+            targetCalendarTitle: targetCalendarTitle,
+            targetSourceIdentifier: targetSourceIdentifier,
+            backupSchemaVersion:
+                ReminderPruneRestorePolicy.currentBackupSchemaVersion,
+            rulesVersion: rulesVersion,
+            items: items,
+            actuallyDeletedIdentifiers: actuallyDeletedIdentifiers,
+            restoreAttemptIdentifier: restoreAttemptIdentifier,
+            restoredItemIdentifiers: restoredItemIdentifiers,
+            restoredAt: restoredAt
+        )
+    }
 }

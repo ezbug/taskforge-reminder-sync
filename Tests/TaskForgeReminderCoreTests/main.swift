@@ -223,6 +223,12 @@ private func pruneBackupFixture() -> ReminderPruneBackupBatch {
     )
 }
 
+private let legacyPruneBackupEnvelopeFixture = Data(
+    """
+    {"checksum":"386b6ec8c52714e00c16f65f69c8dbace2eff0f899613a43f6cbb467796235c1","payload":{"createdAt":-978307180,"identifier":"00000000-0000-0000-0000-0000000000A1","items":[],"restoredItemIdentifiers":{},"rulesVersion":0,"targetCalendarIdentifier":"legacy-calendar","targetCalendarTitle":"Legacy list","targetSourceIdentifier":"legacy-source"}}
+    """.utf8
+)
+
 private let tests: [TestCase] = [
     ("TaskForge v6 MessagePack store decodes task records", {
         let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
@@ -1229,6 +1235,53 @@ private let tests: [TestCase] = [
         )
         try require(revoked.readyIdentifiers.isEmpty, "revoked item must not delete")
     }),
+    ("legacy prune backup verifies old checksum before migration", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let url = try store.saveBackup(pruneBackupFixture())
+        try legacyPruneBackupEnvelopeFixture.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+        let migrated = try store.loadBackup(at: url)
+        try require(
+            migrated.backupSchemaVersion
+                == ReminderPruneRestorePolicy.currentBackupSchemaVersion,
+            "legacy backup did not migrate to schema 1"
+        )
+        try require(
+            migrated.rulesVersion == 0
+                && migrated.targetCalendarTitle == "Legacy list",
+            "legacy payload fields changed during migration"
+        )
+
+        let tampered = String(
+            data: legacyPruneBackupEnvelopeFixture,
+            encoding: .utf8
+        )!.replacingOccurrences(
+            of: "Legacy list",
+            with: "Tampered list"
+        )
+        try Data(tampered.utf8).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+        do {
+            _ = try store.loadBackup(at: url)
+            throw TestFailure(
+                description: "tampered legacy backup was accepted"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .checksumMismatch,
+                "unexpected legacy checksum error"
+            )
+        }
+    }),
     ("restore policy separates backup schema from candidate rules", {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1271,6 +1324,49 @@ private let tests: [TestCase] = [
         )
     }),
     ("prune operation flock does not change the filesystem tree", {
+        let defaultAnchor =
+            try ReminderPruneOperationFileLock.defaultAnchorURL()
+        try require(
+            defaultAnchor.path != "/tmp"
+                && defaultAnchor.path != "/private/tmp",
+            "operation lock must use a per-user anchor"
+        )
+        let defaultBefore = try FileManager.default.contentsOfDirectory(
+            atPath: defaultAnchor.path
+        ).sorted()
+        let defaultShared = try ReminderPruneOperationFileLock(
+            exclusive: false
+        )
+        defaultShared.unlock()
+        let defaultExclusive = try ReminderPruneOperationFileLock(
+            exclusive: true
+        )
+        defaultExclusive.unlock()
+        let defaultAfter = try FileManager.default.contentsOfDirectory(
+            atPath: defaultAnchor.path
+        ).sorted()
+        try require(
+            defaultBefore == defaultAfter,
+            "default per-user flock must not change its directory tree"
+        )
+        do {
+            _ = try ReminderPruneOperationFileLock(
+                exclusive: false,
+                anchorURL: URL(
+                    fileURLWithPath: "/tmp",
+                    isDirectory: true
+                )
+            )
+            throw TestFailure(
+                description: "system temp anchor should be rejected"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .permissions,
+                "unexpected system temp anchor error"
+            )
+        }
+
         let anchor = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: anchor) }
