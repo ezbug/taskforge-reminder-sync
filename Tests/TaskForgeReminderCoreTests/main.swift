@@ -193,6 +193,8 @@ private func pruneBackupFixture() -> ReminderPruneBackupBatch {
         targetCalendarIdentifier: "calendar",
         targetCalendarTitle: "TaskForge 今日",
         targetSourceIdentifier: "source",
+        backupSchemaVersion:
+            ReminderPruneRestorePolicy.currentBackupSchemaVersion,
         rulesVersion: ReminderPruneStateMachine.rulesVersion,
         items: [
             ReminderPruneBackupItem(
@@ -1227,6 +1229,74 @@ private let tests: [TestCase] = [
         )
         try require(revoked.readyIdentifiers.isEmpty, "revoked item must not delete")
     }),
+    ("restore policy separates backup schema from candidate rules", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        var legacyRulesBackup = pruneBackupFixture()
+        legacyRulesBackup.rulesVersion = 0
+        let url = try store.saveBackup(legacyRulesBackup)
+        let loaded = try store.loadBackup(at: url)
+        try require(
+            ReminderPruneRestorePolicy.supportsBackupSchema(
+                loaded.backupSchemaVersion
+            ),
+            "supported schema must remain restorable"
+        )
+        try require(
+            !ReminderPruneRestorePolicy.supportsBackupSchema(
+                loaded.backupSchemaVersion + 1
+            ),
+            "unknown backup schema must be rejected"
+        )
+        try require(
+            loaded.rulesVersion == 0,
+            "candidate rules version must remain audit data"
+        )
+        let now = Date(timeIntervalSince1970: 100)
+        let entry = ReminderPruneRestorePolicy.graceLedgerEntry(
+            fingerprint: "restored",
+            calendarIdentifier: "calendar",
+            now: now,
+            restoreGraceInterval: 1
+        )
+        try require(
+            entry.rulesVersion == ReminderPruneStateMachine.rulesVersion,
+            "restored grace must use current candidate rules"
+        )
+        try require(
+            entry.graceUntil == now.addingTimeInterval(86_400),
+            "restored grace must remain at least 24 hours"
+        )
+    }),
+    ("prune operation flock does not change the filesystem tree", {
+        let anchor = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: anchor) }
+        try FileManager.default.createDirectory(
+            at: anchor,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let before = try FileManager.default.contentsOfDirectory(
+            atPath: anchor.path
+        ).sorted()
+        let shared = try ReminderPruneOperationFileLock(
+            exclusive: false,
+            anchorURL: anchor
+        )
+        shared.unlock()
+        let exclusive = try ReminderPruneOperationFileLock(
+            exclusive: true,
+            anchorURL: anchor
+        )
+        exclusive.unlock()
+        let after = try FileManager.default.contentsOfDirectory(
+            atPath: anchor.path
+        ).sorted()
+        try require(before == after, "flock must not create a lock path")
+    }),
     ("prune read-only ledger load never creates its root", {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1356,6 +1426,11 @@ private let tests: [TestCase] = [
         try require(
             loadedBatch.targetSourceIdentifier == "source",
             "backup source identifier round-trip failed"
+        )
+        try require(
+            loadedBatch.backupSchemaVersion
+                == ReminderPruneRestorePolicy.currentBackupSchemaVersion,
+            "backup schema version round-trip failed"
         )
         try require(
             loadedBatch.rulesVersion

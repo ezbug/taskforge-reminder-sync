@@ -130,6 +130,7 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
     public var targetCalendarIdentifier: String
     public var targetCalendarTitle: String
     public var targetSourceIdentifier: String
+    public var backupSchemaVersion: Int
     public var rulesVersion: Int
     public var items: [ReminderPruneBackupItem]
     public var actuallyDeletedIdentifiers: [String]?
@@ -154,6 +155,7 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
         targetCalendarIdentifier: String,
         targetCalendarTitle: String,
         targetSourceIdentifier: String,
+        backupSchemaVersion: Int,
         rulesVersion: Int,
         items: [ReminderPruneBackupItem],
         actuallyDeletedIdentifiers: [String]?,
@@ -166,6 +168,7 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
         self.targetCalendarIdentifier = targetCalendarIdentifier
         self.targetCalendarTitle = targetCalendarTitle
         self.targetSourceIdentifier = targetSourceIdentifier
+        self.backupSchemaVersion = backupSchemaVersion
         self.rulesVersion = rulesVersion
         self.items = items
         self.actuallyDeletedIdentifiers = actuallyDeletedIdentifiers
@@ -462,7 +465,8 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         guard
             !batch.targetCalendarIdentifier.isEmpty,
             !batch.targetSourceIdentifier.isEmpty,
-            batch.rulesVersion > 0,
+            batch.backupSchemaVersion > 0,
+            batch.rulesVersion >= 0,
             original.count == originalIdentifiers.count,
             originalIdentifiers.allSatisfy({ !$0.isEmpty })
         else {
@@ -665,6 +669,51 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     private func checksum(for data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
+}
+
+public final class ReminderPruneOperationFileLock: @unchecked Sendable {
+    public init(
+        exclusive: Bool,
+        anchorURL: URL = URL(
+            fileURLWithPath: "/tmp",
+            isDirectory: true
+        )
+    ) throws {
+        let path = anchorURL.standardizedFileURL
+            .resolvingSymlinksInPath().path
+        let opened = open(
+            path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY
+        )
+        guard opened >= 0 else {
+            throw ReminderPruneStoreError.permissions
+        }
+        let operation = exclusive ? LOCK_EX : LOCK_SH
+        var result: Int32
+        repeat {
+            result = flock(opened, operation)
+        } while result != 0 && errno == EINTR
+        guard result == 0 else {
+            _ = close(opened)
+            throw ReminderPruneStoreError.permissions
+        }
+        descriptor = opened
+    }
+
+    deinit {
+        unlock()
+    }
+
+    public func unlock() {
+        guard let descriptor else {
+            return
+        }
+        _ = flock(descriptor, LOCK_UN)
+        _ = close(descriptor)
+        self.descriptor = nil
+    }
+
+    private var descriptor: Int32?
 }
 
 private struct BackupEnvelope: Codable {

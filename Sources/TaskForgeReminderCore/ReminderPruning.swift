@@ -183,3 +183,28 @@ public enum ReminderPruneStateMachine {
         )
     }
 }
+
+public enum ReminderPruneRestorePolicy {
+    public static let currentBackupSchemaVersion = 1
+
+    public static func supportsBackupSchema(_ version: Int) -> Bool {
+        version == currentBackupSchemaVersion
+    }
+
+    public static func graceLedgerEntry(
+        fingerprint: String,
+        calendarIdentifier: String,
+        now: Date,
+        restoreGraceInterval: TimeInterval = 86_400
+    ) -> ReminderPruneLedgerEntry {
+        ReminderPruneLedgerEntry(
+            firstSeen: now,
+            fingerprint: fingerprint,
+            calendarIdentifier: calendarIdentifier,
+            rulesVersion: ReminderPruneStateMachine.rulesVersion,
+            graceUntil: now.addingTimeInterval(
+                max(restoreGraceInterval, 86_400)
+            )
+        )
+    }
+}

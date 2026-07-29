@@ -56,71 +56,6 @@ private final class ReminderPrunerOperationGate {
     }
 }
 
-private final class ReminderPrunerFileLock {
-    init(rootURL: URL, exclusive: Bool) throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "TaskForgeReminderSync-PruneLocks",
-                isDirectory: true
-            )
-        do {
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: directory.path
-            )
-        } catch {
-            throw ReminderPrunerError.operationLockFailed
-        }
-        let rootPath = rootURL.standardizedFileURL
-            .resolvingSymlinksInPath().path
-        let name = SHA256.hash(data: Data(rootPath.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
-        let lockURL = directory.appendingPathComponent("\(name).lock")
-        let opened = open(
-            lockURL.path,
-            O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
-            mode_t(0o600)
-        )
-        guard opened >= 0, fchmod(opened, mode_t(0o600)) == 0 else {
-            if opened >= 0 {
-                _ = close(opened)
-            }
-            throw ReminderPrunerError.operationLockFailed
-        }
-        let operation = exclusive ? LOCK_EX : LOCK_SH
-        var result: Int32
-        repeat {
-            result = flock(opened, operation)
-        } while result != 0 && errno == EINTR
-        guard result == 0 else {
-            _ = close(opened)
-            throw ReminderPrunerError.operationLockFailed
-        }
-        descriptor = opened
-    }
-
-    deinit {
-        unlock()
-    }
-
-    func unlock() {
-        guard let descriptor else {
-            return
-        }
-        _ = flock(descriptor, LOCK_UN)
-        _ = close(descriptor)
-        self.descriptor = nil
-    }
-
-    private var descriptor: Int32?
-}
-
 public struct ReminderPruneCounts: Equatable, Sendable {
     public var scanned = 0
     public var firstSeen = 0
@@ -135,7 +70,7 @@ public struct ReminderPruneCounts: Equatable, Sendable {
 public enum ReminderPrunerError: Error, LocalizedError {
     case backupReminderSourceUnavailable
     case backupVerificationFailed
-    case backupRulesVersionUnsupported
+    case backupSchemaVersionUnsupported
     case deletionOutcomeUnresolved
     case ambiguousTargetCalendar
     case operationLockFailed
@@ -149,8 +84,8 @@ public enum ReminderPrunerError: Error, LocalizedError {
             return "找不到备份指定的提醒事项账户，备份仍未消费。"
         case .backupVerificationFailed:
             return "清理备份写入后的回读校验失败。"
-        case .backupRulesVersionUnsupported:
-            return "备份清理规则版本不兼容，备份仍未消费。"
+        case .backupSchemaVersionUnsupported:
+            return "备份格式版本不兼容，备份仍未消费。"
         case .deletionOutcomeUnresolved:
             return "备份尚未记录可核实的实际删除结果，已拒绝恢复。"
         case .ambiguousTargetCalendar:
@@ -192,10 +127,7 @@ public final class ReminderPruner {
         defer {
             ReminderPrunerOperationGate.shared.release(operationKey)
         }
-        let operationLock = try ReminderPrunerFileLock(
-            rootURL: configuration.localRoot,
-            exclusive: false
-        )
+        let operationLock = try operationFileLock(exclusive: false)
         defer { operationLock.unlock() }
 
         guard let targetCalendar = targetCalendar() else {
@@ -235,10 +167,7 @@ public final class ReminderPruner {
         defer {
             ReminderPrunerOperationGate.shared.release(operationKey)
         }
-        let operationLock = try ReminderPrunerFileLock(
-            rootURL: configuration.localRoot,
-            exclusive: true
-        )
+        let operationLock = try operationFileLock(exclusive: true)
         defer { operationLock.unlock() }
 
         guard let targetCalendar = targetCalendar() else {
@@ -316,6 +245,8 @@ public final class ReminderPruner {
             targetCalendarTitle: targetCalendar.title,
             targetSourceIdentifier:
                 targetCalendar.source.sourceIdentifier,
+            backupSchemaVersion:
+                ReminderPruneRestorePolicy.currentBackupSchemaVersion,
             rulesVersion: ReminderPruneStateMachine.rulesVersion,
             items: confirmed.map {
                 ReminderBackupAdapter.capture(
@@ -398,10 +329,7 @@ public final class ReminderPruner {
         defer {
             ReminderPrunerOperationGate.shared.release(operationKey)
         }
-        let operationLock = try ReminderPrunerFileLock(
-            rootURL: configuration.localRoot,
-            exclusive: true
-        )
+        let operationLock = try operationFileLock(exclusive: true)
         defer { operationLock.unlock() }
 
         guard let (backupURL, originalBackup) =
@@ -410,10 +338,11 @@ public final class ReminderPruner {
             return ReminderPruneCounts()
         }
         guard
-            originalBackup.rulesVersion
-                == ReminderPruneStateMachine.rulesVersion
+            ReminderPruneRestorePolicy.supportsBackupSchema(
+                originalBackup.backupSchemaVersion
+            )
         else {
-            throw ReminderPrunerError.backupRulesVersionUnsupported
+            throw ReminderPrunerError.backupSchemaVersionUnsupported
         }
         guard
             let items = originalBackup.actuallyDeletedItems
@@ -529,14 +458,11 @@ public final class ReminderPruner {
             reminders: refreshed
         )
         var ledger = try localStore.loadLedger()
-        let graceUntil = now.addingTimeInterval(
-            max(configuration.restoreGraceInterval, 86_400)
-        )
         for pair in finalPairs {
             let reminder = pair.reminder
             let identifier = reminder.calendarItemIdentifier
-            ledger.entries[identifier] = ReminderPruneLedgerEntry(
-                firstSeen: now,
+            ledger.entries[identifier] =
+                ReminderPruneRestorePolicy.graceLedgerEntry(
                 fingerprint: fingerprint(
                     reminder: reminder,
                     targetCalendarIdentifier:
@@ -544,8 +470,8 @@ public final class ReminderPruner {
                     presence: pair.item.taskPresence
                 ),
                 calendarIdentifier: refreshedCalendar.calendarIdentifier,
-                rulesVersion: backup.rulesVersion,
-                graceUntil: graceUntil
+                now: now,
+                restoreGraceInterval: configuration.restoreGraceInterval
             )
         }
         try localStore.saveLedger(ledger)
@@ -567,6 +493,18 @@ public final class ReminderPruner {
     private var operationKey: String {
         configuration.localRoot.standardizedFileURL
             .resolvingSymlinksInPath().path
+    }
+
+    private func operationFileLock(
+        exclusive: Bool
+    ) throws -> ReminderPruneOperationFileLock {
+        do {
+            return try ReminderPruneOperationFileLock(
+                exclusive: exclusive
+            )
+        } catch {
+            throw ReminderPrunerError.operationLockFailed
+        }
     }
 
     private func targetCalendar() -> EKCalendar? {
