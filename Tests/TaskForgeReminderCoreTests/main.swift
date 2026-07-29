@@ -779,6 +779,99 @@ private let tests: [TestCase] = [
             ),
             "completed historical source should be recognized"
         )
+    }),
+    ("prune policy protects non-target, completed and important reminders", {
+        let target = "calendar-target"
+        let protected = [
+            ReminderPruneObservation(
+                itemIdentifier: "other-list",
+                calendarIdentifier: "calendar-other",
+                isCompleted: false,
+                priority: 0,
+                title: "普通提醒",
+                fingerprint: "a",
+                taskPresence: .absent
+            ),
+            ReminderPruneObservation(
+                itemIdentifier: "completed",
+                calendarIdentifier: target,
+                isCompleted: true,
+                priority: 0,
+                title: "普通提醒",
+                fingerprint: "b",
+                taskPresence: .absent
+            ),
+            ReminderPruneObservation(
+                itemIdentifier: "priority",
+                calendarIdentifier: target,
+                isCompleted: false,
+                priority: 1,
+                title: "普通提醒",
+                fingerprint: "c",
+                taskPresence: .absent
+            )
+        ]
+        for observation in protected {
+            try require(
+                !ReminderPruneCandidatePolicy.isCandidate(
+                    observation,
+                    targetCalendarIdentifier: target
+                ),
+                "\(observation.itemIdentifier) must be protected"
+            )
+        }
+    }),
+    ("prune policy recognizes every approved title prefix", {
+        for (index, prefix) in ["!", "！", "❗", "‼️", "⭐", "📌"].enumerated() {
+            let observation = ReminderPruneObservation(
+                itemIdentifier: "important-\(index)",
+                calendarIdentifier: "calendar-target",
+                isCompleted: false,
+                priority: 0,
+                title: "  \(prefix) 保留",
+                fingerprint: "\(index)",
+                taskPresence: .absent
+            )
+            try require(
+                !ReminderPruneCandidatePolicy.isCandidate(
+                    observation,
+                    targetCalendarIdentifier: "calendar-target"
+                ),
+                "\(prefix) must protect the reminder"
+            )
+        }
+    }),
+    ("prune policy only selects an unimportant absent TaskForge task", {
+        let base = ReminderPruneObservation(
+            itemIdentifier: "external",
+            calendarIdentifier: "calendar-target",
+            isCompleted: false,
+            priority: 0,
+            title: "普通提醒",
+            fingerprint: "stable",
+            taskPresence: .absent
+        )
+        try require(
+            ReminderPruneCandidatePolicy.isCandidate(
+                base,
+                targetCalendarIdentifier: "calendar-target"
+            ),
+            "external reminder should become a candidate"
+        )
+        for presence in [
+            TaskForgeReminderPresence.currentSnapshot,
+            .sourceConfirmed,
+            .indeterminate
+        ] {
+            let protected = base.withTaskPresence(presence)
+            try require(
+                !ReminderPruneCandidatePolicy.isCandidate(
+                    protected,
+                    targetCalendarIdentifier: "calendar-target"
+                ),
+                "\(presence) must fail closed"
+            )
+        }
     })
 ]
 
