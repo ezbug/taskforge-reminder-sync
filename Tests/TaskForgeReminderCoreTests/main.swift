@@ -1068,6 +1068,48 @@ private let tests: [TestCase] = [
             "changed item should receive a new firstSeen"
         )
     }),
+    ("prune state clamps custom confirmation intervals to sixty seconds", {
+        let now = Date(timeIntervalSince1970: 2_500)
+        let observation = ReminderPruneObservation(
+            itemIdentifier: "external",
+            calendarIdentifier: "calendar-target",
+            isCompleted: false,
+            priority: 0,
+            title: "普通提醒",
+            fingerprint: "stable",
+            taskPresence: .absent
+        )
+        let first = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: ReminderPruneLedger(),
+            targetCalendarIdentifier: "calendar-target",
+            now: now
+        )
+        for confirmationInterval: TimeInterval in [0, 59] {
+            let early = ReminderPruneStateMachine.plan(
+                observations: [observation],
+                prior: first.nextLedger,
+                targetCalendarIdentifier: "calendar-target",
+                now: now.addingTimeInterval(59),
+                confirmationInterval: confirmationInterval
+            )
+            try require(
+                early.readyIdentifiers.isEmpty,
+                "\(confirmationInterval) seconds must not bypass confirmation"
+            )
+        }
+        let ready = ReminderPruneStateMachine.plan(
+            observations: [observation],
+            prior: first.nextLedger,
+            targetCalendarIdentifier: "calendar-target",
+            now: now.addingTimeInterval(60),
+            confirmationInterval: 0
+        )
+        try require(
+            ready.readyIdentifiers == ["external"],
+            "clamped interval should allow readiness at sixty seconds"
+        )
+    }),
     ("prune state restarts after restore grace and rule changes", {
         let now = Date(timeIntervalSince1970: 3_000)
         let observation = ReminderPruneObservation(

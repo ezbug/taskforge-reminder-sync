@@ -122,6 +122,7 @@ public enum ReminderPruneStateMachine {
         now: Date,
         confirmationInterval: TimeInterval = 60
     ) -> ReminderPrunePlan {
+        let effectiveConfirmationInterval = max(confirmationInterval, 60)
         var next = ReminderPruneLedger()
         var firstSeen: [String] = []
         var waiting: [String] = []
@@ -161,7 +162,8 @@ public enum ReminderPruneStateMachine {
                     )
                     firstSeen.append(observation.itemIdentifier)
                 }
-            } else if let old, now.timeIntervalSince(old.firstSeen) >= confirmationInterval {
+            } else if let old,
+                now.timeIntervalSince(old.firstSeen) >= effectiveConfirmationInterval {
                 next.entries[observation.itemIdentifier] = old
                 ready.append(observation.itemIdentifier)
             } else if let old {
