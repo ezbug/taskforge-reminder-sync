@@ -193,6 +193,7 @@ private func pruneBackupFixture() -> ReminderPruneBackupBatch {
         targetCalendarIdentifier: "calendar",
         targetCalendarTitle: "TaskForge 今日",
         targetSourceIdentifier: "source",
+        rulesVersion: ReminderPruneStateMachine.rulesVersion,
         items: [
             ReminderPruneBackupItem(
                 originalItemIdentifier: "item",
@@ -209,9 +210,13 @@ private func pruneBackupFixture() -> ReminderPruneBackupBatch {
                 ),
                 startDateComponents: nil,
                 alarms: [],
-                recurrenceRules: []
+                recurrenceRules: [],
+                taskPresence: .absent
             )
         ],
+        actuallyDeletedIdentifiers: nil,
+        restoreAttemptIdentifier: nil,
+        restoredItemIdentifiers: [:],
         restoredAt: nil
     )
 }
@@ -1222,6 +1227,95 @@ private let tests: [TestCase] = [
         )
         try require(revoked.readyIdentifiers.isEmpty, "revoked item must not delete")
     }),
+    ("prune read-only ledger load never creates its root", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        try require(
+            try store.loadLedgerReadOnly() == ReminderPruneLedger(),
+            "missing read-only ledger should be empty"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: root.path),
+            "read-only ledger load must not create its root"
+        )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try require(
+            try store.loadLedgerReadOnly() == ReminderPruneLedger(),
+            "missing read-only ledger should remain empty"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: store.ledgerURL.path),
+            "read-only ledger load must not create the ledger"
+        )
+    }),
+    ("prune backup persists deletion and idempotent restore readback", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        var batch = pruneBackupFixture()
+        var notDeleted = batch.items[0]
+        notDeleted.originalItemIdentifier = "not-deleted"
+        batch.items.append(notDeleted)
+        let url = try store.saveBackup(batch)
+        try store.recordActuallyDeletedIdentifiers(["item"], at: url)
+        let firstAttempt = try store.beginRestoreAttempt(at: url)
+        let secondAttempt = try store.beginRestoreAttempt(at: url)
+        try require(
+            firstAttempt.restoreAttemptIdentifier
+                == secondAttempt.restoreAttemptIdentifier,
+            "restore attempt must be stable across retries"
+        )
+        try store.recordRestoreReadback(
+            ["item": "restored-item"],
+            at: url
+        )
+        let loaded = try store.loadBackup(at: url)
+        try require(
+            loaded.actuallyDeletedIdentifiers == ["item"],
+            "actual deletion result did not persist"
+        )
+        try require(
+            loaded.actuallyDeletedItems?.map(\.originalItemIdentifier)
+                == ["item"],
+            "restore selection must exclude attempted but retained items"
+        )
+        try require(
+            loaded.restoredItemIdentifiers == ["item": "restored-item"],
+            "restore readback did not persist"
+        )
+        do {
+            try store.recordActuallyDeletedIdentifiers([], at: url)
+            throw TestFailure(
+                description: "deletion result overwrite should fail"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .invalidBackup,
+                "unexpected deletion overwrite error"
+            )
+        }
+        do {
+            try store.recordRestoreReadback(
+                ["item": "different-restored-item"],
+                at: url
+            )
+            throw TestFailure(
+                description: "restore readback overwrite should fail"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .invalidBackup,
+                "unexpected restore overwrite error"
+            )
+        }
+    }),
     ("prune local store writes private ledger and verified backup", {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1262,6 +1356,15 @@ private let tests: [TestCase] = [
         try require(
             loadedBatch.targetSourceIdentifier == "source",
             "backup source identifier round-trip failed"
+        )
+        try require(
+            loadedBatch.rulesVersion
+                == ReminderPruneStateMachine.rulesVersion,
+            "backup rules version round-trip failed"
+        )
+        try require(
+            loadedBatch.items.first?.taskPresence == .absent,
+            "backup task presence round-trip failed"
         )
     }),
     ("prune local store rejects a modified backup", {
@@ -1378,6 +1481,12 @@ private let tests: [TestCase] = [
         let store = ReminderPruneLocalStore(rootURL: root)
         let backupURL = try store.saveBackup(pruneBackupFixture())
         let restoredAt = Date(timeIntervalSince1970: 99)
+        try store.recordActuallyDeletedIdentifiers(["item"], at: backupURL)
+        _ = try store.beginRestoreAttempt(at: backupURL)
+        try store.recordRestoreReadback(
+            ["item": "restored-item"],
+            at: backupURL
+        )
         try store.markRestored(at: backupURL, date: restoredAt)
         try require(
             try store.loadBackup(at: backupURL).restoredAt == restoredAt,

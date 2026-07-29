@@ -5,6 +5,13 @@ import TaskForgeReminderCore
 
 enum ReminderBackupAdapter {
     static func capture(_ reminder: EKReminder) -> ReminderPruneBackupItem {
+        capture(reminder, taskPresence: .indeterminate)
+    }
+
+    static func capture(
+        _ reminder: EKReminder,
+        taskPresence: TaskForgeReminderPresence
+    ) -> ReminderPruneBackupItem {
         ReminderPruneBackupItem(
             originalItemIdentifier: reminder.calendarItemIdentifier,
             title: reminder.title ?? "",
@@ -16,7 +23,8 @@ enum ReminderBackupAdapter {
             alarms: (reminder.alarms ?? []).map(captureAlarm),
             recurrenceRules: (reminder.recurrenceRules ?? []).map(
                 captureRecurrence
-            )
+            ),
+            taskPresence: taskPresence
         )
     }
 

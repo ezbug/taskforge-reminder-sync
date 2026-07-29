@@ -97,6 +97,7 @@ public struct ReminderPruneBackupItem: Codable, Equatable, Sendable {
     public var startDateComponents: DateComponents?
     public var alarms: [ReminderAlarmBackup]
     public var recurrenceRules: [ReminderRecurrenceBackup]
+    public var taskPresence: TaskForgeReminderPresence
 
     public init(
         originalItemIdentifier: String,
@@ -107,7 +108,8 @@ public struct ReminderPruneBackupItem: Codable, Equatable, Sendable {
         dueDateComponents: DateComponents?,
         startDateComponents: DateComponents?,
         alarms: [ReminderAlarmBackup],
-        recurrenceRules: [ReminderRecurrenceBackup]
+        recurrenceRules: [ReminderRecurrenceBackup],
+        taskPresence: TaskForgeReminderPresence
     ) {
         self.originalItemIdentifier = originalItemIdentifier
         self.title = title
@@ -118,6 +120,7 @@ public struct ReminderPruneBackupItem: Codable, Equatable, Sendable {
         self.startDateComponents = startDateComponents
         self.alarms = alarms
         self.recurrenceRules = recurrenceRules
+        self.taskPresence = taskPresence
     }
 }
 
@@ -127,8 +130,23 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
     public var targetCalendarIdentifier: String
     public var targetCalendarTitle: String
     public var targetSourceIdentifier: String
+    public var rulesVersion: Int
     public var items: [ReminderPruneBackupItem]
+    public var actuallyDeletedIdentifiers: [String]?
+    public var restoreAttemptIdentifier: UUID?
+    public var restoredItemIdentifiers: [String: String]
     public var restoredAt: Date?
+
+    public var actuallyDeletedItems: [ReminderPruneBackupItem]? {
+        guard let identifiers = actuallyDeletedIdentifiers else {
+            return nil
+        }
+        let deleted = Set(identifiers)
+        let result = items.filter {
+            deleted.contains($0.originalItemIdentifier)
+        }
+        return result.count == deleted.count ? result : nil
+    }
 
     public init(
         identifier: UUID,
@@ -136,7 +154,11 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
         targetCalendarIdentifier: String,
         targetCalendarTitle: String,
         targetSourceIdentifier: String,
+        rulesVersion: Int,
         items: [ReminderPruneBackupItem],
+        actuallyDeletedIdentifiers: [String]?,
+        restoreAttemptIdentifier: UUID?,
+        restoredItemIdentifiers: [String: String],
         restoredAt: Date?
     ) {
         self.identifier = identifier
@@ -144,7 +166,11 @@ public struct ReminderPruneBackupBatch: Codable, Equatable, Sendable {
         self.targetCalendarIdentifier = targetCalendarIdentifier
         self.targetCalendarTitle = targetCalendarTitle
         self.targetSourceIdentifier = targetSourceIdentifier
+        self.rulesVersion = rulesVersion
         self.items = items
+        self.actuallyDeletedIdentifiers = actuallyDeletedIdentifiers
+        self.restoreAttemptIdentifier = restoreAttemptIdentifier
+        self.restoredItemIdentifiers = restoredItemIdentifiers
         self.restoredAt = restoredAt
     }
 }
@@ -181,6 +207,23 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             return ReminderPruneLedger()
         }
 
+        try ensurePrivateFile(ledgerURL)
+        let data = try readData(at: ledgerURL, error: .invalidLedger)
+        do {
+            return try decoder.decode(ReminderPruneLedger.self, from: data)
+        } catch {
+            throw ReminderPruneStoreError.invalidLedger
+        }
+    }
+
+    public func loadLedgerReadOnly() throws -> ReminderPruneLedger {
+        guard try attributesIfItemExists(at: rootURL) != nil else {
+            return ReminderPruneLedger()
+        }
+        try ensurePermissions(of: rootURL, expected: 0o700)
+        guard try itemExists(at: ledgerURL) else {
+            return ReminderPruneLedger()
+        }
         try ensurePrivateFile(ledgerURL)
         let data = try readData(at: ledgerURL, error: .invalidLedger)
         do {
@@ -231,6 +274,9 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         guard envelope.checksum == checksum(for: payload) else {
             throw ReminderPruneStoreError.checksumMismatch
         }
+        guard isValidBackup(envelope.payload) else {
+            throw ReminderPruneStoreError.invalidBackup
+        }
         try ensurePrivateFile(url)
         return envelope.payload
     }
@@ -265,7 +311,68 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
 
     public func markRestored(at url: URL, date: Date) throws {
         var batch = try loadBackup(at: url)
+        guard batch.actuallyDeletedIdentifiers != nil else {
+            throw ReminderPruneStoreError.invalidBackup
+        }
         batch.restoredAt = date
+        try saveBackup(batch, to: url)
+    }
+
+    public func recordActuallyDeletedIdentifiers(
+        _ identifiers: [String],
+        at url: URL
+    ) throws {
+        var batch = try loadBackup(at: url)
+        let original = Set(batch.items.map(\.originalItemIdentifier))
+        let deleted = Set(identifiers)
+        guard deleted.isSubset(of: original) else {
+            throw ReminderPruneStoreError.invalidBackup
+        }
+        if let existing = batch.actuallyDeletedIdentifiers {
+            guard Set(existing) == deleted else {
+                throw ReminderPruneStoreError.invalidBackup
+            }
+            return
+        }
+        batch.actuallyDeletedIdentifiers = deleted.sorted()
+        try saveBackup(batch, to: url)
+    }
+
+    public func beginRestoreAttempt(
+        at url: URL
+    ) throws -> ReminderPruneBackupBatch {
+        var batch = try loadBackup(at: url)
+        guard batch.actuallyDeletedIdentifiers != nil else {
+            throw ReminderPruneStoreError.invalidBackup
+        }
+        if batch.restoreAttemptIdentifier == nil {
+            batch.restoreAttemptIdentifier = UUID()
+            try saveBackup(batch, to: url)
+        }
+        return batch
+    }
+
+    public func recordRestoreReadback(
+        _ identifiers: [String: String],
+        at url: URL
+    ) throws {
+        var batch = try loadBackup(at: url)
+        guard
+            batch.restoreAttemptIdentifier != nil,
+            let deleted = batch.actuallyDeletedIdentifiers,
+            Set(identifiers.keys) == Set(deleted),
+            identifiers.values.allSatisfy({ !$0.isEmpty }),
+            Set(identifiers.values).count == identifiers.count
+        else {
+            throw ReminderPruneStoreError.invalidBackup
+        }
+        if !batch.restoredItemIdentifiers.isEmpty {
+            guard batch.restoredItemIdentifiers == identifiers else {
+                throw ReminderPruneStoreError.invalidBackup
+            }
+            return
+        }
+        batch.restoredItemIdentifiers = identifiers
         try saveBackup(batch, to: url)
     }
 
@@ -330,6 +437,9 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             throw ReminderPruneStoreError.invalidBackup
         }
 
+        guard isValidBackup(batch) else {
+            throw ReminderPruneStoreError.invalidBackup
+        }
         let payload: Data
         let data: Data
         do {
@@ -344,6 +454,50 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             throw ReminderPruneStoreError.invalidBackup
         }
         try writeAtomically(data, to: url)
+    }
+
+    private func isValidBackup(_ batch: ReminderPruneBackupBatch) -> Bool {
+        let originalIdentifiers = batch.items.map(\.originalItemIdentifier)
+        let original = Set(originalIdentifiers)
+        guard
+            !batch.targetCalendarIdentifier.isEmpty,
+            !batch.targetSourceIdentifier.isEmpty,
+            batch.rulesVersion > 0,
+            original.count == originalIdentifiers.count,
+            originalIdentifiers.allSatisfy({ !$0.isEmpty })
+        else {
+            return false
+        }
+        if let deleted = batch.actuallyDeletedIdentifiers {
+            guard
+                Set(deleted).count == deleted.count,
+                Set(deleted).isSubset(of: original)
+            else {
+                return false
+            }
+        } else if batch.restoreAttemptIdentifier != nil
+            || !batch.restoredItemIdentifiers.isEmpty
+            || batch.restoredAt != nil
+        {
+            return false
+        }
+        if !batch.restoredItemIdentifiers.isEmpty {
+            guard
+                batch.restoreAttemptIdentifier != nil,
+                let deleted = batch.actuallyDeletedIdentifiers,
+                Set(batch.restoredItemIdentifiers.keys) == Set(deleted),
+                batch.restoredItemIdentifiers.values.allSatisfy({
+                    !$0.isEmpty
+                }),
+                Set(batch.restoredItemIdentifiers.values).count
+                    == batch.restoredItemIdentifiers.count
+            else {
+                return false
+            }
+        }
+        return batch.restoredAt == nil
+            || batch.actuallyDeletedIdentifiers?.isEmpty == true
+            || !batch.restoredItemIdentifiers.isEmpty
     }
 
     private func ensureDirectory(_ url: URL) throws {

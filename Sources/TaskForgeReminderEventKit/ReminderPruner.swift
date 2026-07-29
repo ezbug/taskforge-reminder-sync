@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import EventKit
 import Foundation
 import TaskForgeReminderCore
@@ -22,6 +23,104 @@ public struct ReminderPruneConfiguration: Sendable {
     }
 }
 
+@MainActor
+private final class ReminderPrunerOperationGate {
+    static let shared = ReminderPrunerOperationGate()
+
+    private var held: Set<String> = []
+    private var waiters: [
+        String: [CheckedContinuation<Void, Never>]
+    ] = [:]
+
+    func acquire(_ key: String) async {
+        if held.insert(key).inserted {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters[key, default: []].append(continuation)
+        }
+    }
+
+    func release(_ key: String) {
+        if var pending = waiters[key], !pending.isEmpty {
+            let next = pending.removeFirst()
+            if pending.isEmpty {
+                waiters.removeValue(forKey: key)
+            } else {
+                waiters[key] = pending
+            }
+            next.resume()
+        } else {
+            held.remove(key)
+        }
+    }
+}
+
+private final class ReminderPrunerFileLock {
+    init(rootURL: URL, exclusive: Bool) throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "TaskForgeReminderSync-PruneLocks",
+                isDirectory: true
+            )
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directory.path
+            )
+        } catch {
+            throw ReminderPrunerError.operationLockFailed
+        }
+        let rootPath = rootURL.standardizedFileURL
+            .resolvingSymlinksInPath().path
+        let name = SHA256.hash(data: Data(rootPath.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let lockURL = directory.appendingPathComponent("\(name).lock")
+        let opened = open(
+            lockURL.path,
+            O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600)
+        )
+        guard opened >= 0, fchmod(opened, mode_t(0o600)) == 0 else {
+            if opened >= 0 {
+                _ = close(opened)
+            }
+            throw ReminderPrunerError.operationLockFailed
+        }
+        let operation = exclusive ? LOCK_EX : LOCK_SH
+        var result: Int32
+        repeat {
+            result = flock(opened, operation)
+        } while result != 0 && errno == EINTR
+        guard result == 0 else {
+            _ = close(opened)
+            throw ReminderPrunerError.operationLockFailed
+        }
+        descriptor = opened
+    }
+
+    deinit {
+        unlock()
+    }
+
+    func unlock() {
+        guard let descriptor else {
+            return
+        }
+        _ = flock(descriptor, LOCK_UN)
+        _ = close(descriptor)
+        self.descriptor = nil
+    }
+
+    private var descriptor: Int32?
+}
+
 public struct ReminderPruneCounts: Equatable, Sendable {
     public var scanned = 0
     public var firstSeen = 0
@@ -36,6 +135,12 @@ public struct ReminderPruneCounts: Equatable, Sendable {
 public enum ReminderPrunerError: Error, LocalizedError {
     case backupReminderSourceUnavailable
     case backupVerificationFailed
+    case backupRulesVersionUnsupported
+    case deletionOutcomeUnresolved
+    case ambiguousTargetCalendar
+    case operationLockFailed
+    case reminderFetchFailed
+    case restoreReadbackAmbiguous
     case restoredReminderReadbackFailed
 
     public var errorDescription: String? {
@@ -44,6 +149,18 @@ public enum ReminderPrunerError: Error, LocalizedError {
             return "找不到备份指定的提醒事项账户，备份仍未消费。"
         case .backupVerificationFailed:
             return "清理备份写入后的回读校验失败。"
+        case .backupRulesVersionUnsupported:
+            return "备份清理规则版本不兼容，备份仍未消费。"
+        case .deletionOutcomeUnresolved:
+            return "备份尚未记录可核实的实际删除结果，已拒绝恢复。"
+        case .ambiguousTargetCalendar:
+            return "原账户中存在多个同名提醒列表，已拒绝选择。"
+        case .operationLockFailed:
+            return "无法取得提醒清理操作锁。"
+        case .reminderFetchFailed:
+            return "提醒事项读取失败，已按失败关闭。"
+        case .restoreReadbackAmbiguous:
+            return "恢复尝试的提醒回读不唯一，备份仍未消费。"
         case .restoredReminderReadbackFailed:
             return "恢复提交后未能回读全部新提醒，备份仍未消费。"
         }
@@ -71,10 +188,20 @@ public final class ReminderPruner {
         snapshot: TaskForgeSnapshot,
         now: Date = Date()
     ) async throws -> ReminderPruneCounts {
+        await ReminderPrunerOperationGate.shared.acquire(operationKey)
+        defer {
+            ReminderPrunerOperationGate.shared.release(operationKey)
+        }
+        let operationLock = try ReminderPrunerFileLock(
+            rootURL: configuration.localRoot,
+            exclusive: false
+        )
+        defer { operationLock.unlock() }
+
         guard let targetCalendar = targetCalendar() else {
             return ReminderPruneCounts()
         }
-        let reminders = await fetchReminders(in: targetCalendar)
+        let reminders = try await fetchReminders(in: targetCalendar)
         let observations = reminders.compactMap {
             observation(
                 for: $0,
@@ -82,7 +209,7 @@ public final class ReminderPruner {
                 snapshot: snapshot
             )
         }
-        let prior = try localStore.loadLedger()
+        let prior = try localStore.loadLedgerReadOnly()
         let plan = ReminderPruneStateMachine.plan(
             observations: observations,
             prior: prior,
@@ -104,10 +231,24 @@ public final class ReminderPruner {
         snapshot: TaskForgeSnapshot,
         now: Date = Date()
     ) async throws -> ReminderPruneCounts {
+        await ReminderPrunerOperationGate.shared.acquire(operationKey)
+        defer {
+            ReminderPrunerOperationGate.shared.release(operationKey)
+        }
+        let operationLock = try ReminderPrunerFileLock(
+            rootURL: configuration.localRoot,
+            exclusive: true
+        )
+        defer { operationLock.unlock() }
+
         guard let targetCalendar = targetCalendar() else {
             return ReminderPruneCounts()
         }
-        let initialReminders = await fetchReminders(in: targetCalendar)
+        let initialReminders = try await fetchReminders(in: targetCalendar)
+        try reconcileUnresolvedBackup(
+            targetCalendar: targetCalendar,
+            reminders: initialReminders
+        )
         let observations = initialReminders.compactMap {
             observation(
                 for: $0,
@@ -131,13 +272,17 @@ public final class ReminderPruner {
             targetCalendarIdentifier: targetCalendar.calendarIdentifier,
             plan: initialPlan
         )
-        var confirmed: [EKReminder] = []
+        let freshReminders = try await fetchReminders(in: targetCalendar)
+        var freshByIdentifier: [String: EKReminder] = [:]
+        for reminder in freshReminders {
+            freshByIdentifier[reminder.calendarItemIdentifier] = reminder
+        }
+        var confirmed: [
+            (reminder: EKReminder, observation: ReminderPruneObservation)
+        ] = []
         for identifier in initialPlan.readyIdentifiers {
-            let current = await fetchReminders(in: targetCalendar).first {
-                $0.calendarItemIdentifier == identifier
-            }
             guard
-                let current,
+                let current = freshByIdentifier[identifier],
                 let currentObservation = observation(
                     for: current,
                     targetCalendar: targetCalendar,
@@ -154,7 +299,7 @@ public final class ReminderPruner {
                 confirmationInterval: configuration.confirmationInterval
             )
             if recheck.readyIdentifiers == [identifier] {
-                confirmed.append(current)
+                confirmed.append((current, currentObservation))
             }
         }
         counts.ready = confirmed.count
@@ -171,7 +316,16 @@ public final class ReminderPruner {
             targetCalendarTitle: targetCalendar.title,
             targetSourceIdentifier:
                 targetCalendar.source.sourceIdentifier,
-            items: confirmed.map(ReminderBackupAdapter.capture),
+            rulesVersion: ReminderPruneStateMachine.rulesVersion,
+            items: confirmed.map {
+                ReminderBackupAdapter.capture(
+                    $0.reminder,
+                    taskPresence: $0.observation.taskPresence
+                )
+            },
+            actuallyDeletedIdentifiers: nil,
+            restoreAttemptIdentifier: nil,
+            restoredItemIdentifiers: [:],
             restoredAt: nil
         )
         let backupURL = try localStore.saveBackup(backup)
@@ -180,9 +334,12 @@ public final class ReminderPruner {
         }
 
         let confirmedIdentifiers = Set(
-            confirmed.map(\.calendarItemIdentifier)
+            confirmed.map(\.reminder.calendarItemIdentifier)
         )
-        for reminder in confirmed {
+        let targetCalendarIdentifier = targetCalendar.calendarIdentifier
+        let targetSourceIdentifier = targetCalendar.source.sourceIdentifier
+        for candidate in confirmed {
+            let reminder = candidate.reminder
             do {
                 try eventStore.remove(reminder, commit: false)
             } catch {
@@ -200,23 +357,26 @@ public final class ReminderPruner {
         } catch {
             logError("清理提交失败，将按回读实际状态结算。")
         }
-        let targetCalendarIdentifier = targetCalendar.calendarIdentifier
         eventStore.reset()
 
         var ledger = initialPlan.nextLedger
         guard
             let refreshedCalendar = eventStore.calendar(
                 withIdentifier: targetCalendarIdentifier
-            )
+            ),
+            refreshedCalendar.source.sourceIdentifier == targetSourceIdentifier
         else {
-            counts.failed = confirmedIdentifiers.count
-            log(summary(prefix: "清理推进", counts: counts))
-            return counts
+            throw ReminderPrunerError.reminderFetchFailed
         }
         let remaining = Set(
-            await fetchReminders(in: refreshedCalendar).map(
+            try await fetchReminders(in: refreshedCalendar).map(
                 \.calendarItemIdentifier
             )
+        )
+        let actuallyDeleted = confirmedIdentifiers.subtracting(remaining)
+        try localStore.recordActuallyDeletedIdentifiers(
+            actuallyDeleted.sorted(),
+            at: backupURL
         )
         for identifier in confirmedIdentifiers {
             if remaining.contains(identifier) {
@@ -234,23 +394,120 @@ public final class ReminderPruner {
     public func restoreLast(
         now: Date = Date()
     ) async throws -> ReminderPruneCounts {
-        guard let (backupURL, backup) = try localStore.latestUnrestoredBackup()
+        await ReminderPrunerOperationGate.shared.acquire(operationKey)
+        defer {
+            ReminderPrunerOperationGate.shared.release(operationKey)
+        }
+        let operationLock = try ReminderPrunerFileLock(
+            rootURL: configuration.localRoot,
+            exclusive: true
+        )
+        defer { operationLock.unlock() }
+
+        guard let (backupURL, originalBackup) =
+            try localStore.latestUnrestoredBackup()
         else {
             return ReminderPruneCounts()
         }
-        let calendar = try targetCalendar()
-            ?? createTargetCalendar(
-                title: backup.targetCalendarTitle,
-                sourceIdentifier: backup.targetSourceIdentifier
-            )
-        var created: [EKReminder] = []
-        do {
-            for item in backup.items {
+        guard
+            originalBackup.rulesVersion
+                == ReminderPruneStateMachine.rulesVersion
+        else {
+            throw ReminderPrunerError.backupRulesVersionUnsupported
+        }
+        guard
+            let items = originalBackup.actuallyDeletedItems
+        else {
+            throw ReminderPrunerError.deletionOutcomeUnresolved
+        }
+        if items.isEmpty {
+            try localStore.markRestored(at: backupURL, date: now)
+            return ReminderPruneCounts()
+        }
+
+        let backup = try localStore.beginRestoreAttempt(at: backupURL)
+        guard let attemptIdentifier = backup.restoreAttemptIdentifier else {
+            throw ReminderPrunerError.deletionOutcomeUnresolved
+        }
+        var calendar = try restoreTargetCalendar(for: backup)
+        var reminders = try await fetchReminders(in: calendar)
+        var restoredIdentifiers = backup.restoredItemIdentifiers
+
+        if restoredIdentifiers.isEmpty {
+            var stagedCreation = false
+            for item in items {
+                let marker = restoreMarker(
+                    backupIdentifier: backup.identifier,
+                    attemptIdentifier: attemptIdentifier,
+                    originalItemIdentifier: item.originalItemIdentifier
+                )
+                let matches = reminders.filter {
+                    containsRestoreMarker($0.notes, marker: marker)
+                }
+                guard matches.count <= 1 else {
+                    throw ReminderPrunerError.restoreReadbackAmbiguous
+                }
+                guard matches.isEmpty else {
+                    continue
+                }
                 let reminder = EKReminder(eventStore: eventStore)
                 reminder.calendar = calendar
                 ReminderBackupAdapter.restore(item, into: reminder)
+                reminder.notes = addingRestoreMarker(
+                    to: item.notes,
+                    marker: marker
+                )
                 try eventStore.save(reminder, commit: false)
-                created.append(reminder)
+                stagedCreation = true
+            }
+            if stagedCreation {
+                let calendarIdentifier = calendar.calendarIdentifier
+                let sourceIdentifier = calendar.source.sourceIdentifier
+                do {
+                    try eventStore.commit()
+                } catch {
+                    eventStore.reset()
+                    throw error
+                }
+                eventStore.reset()
+                calendar = try exactRestoreCalendar(
+                    identifier: calendarIdentifier,
+                    sourceIdentifier: sourceIdentifier
+                )
+            }
+            reminders = try await fetchReminders(in: calendar)
+            for item in items {
+                let marker = restoreMarker(
+                    backupIdentifier: backup.identifier,
+                    attemptIdentifier: attemptIdentifier,
+                    originalItemIdentifier: item.originalItemIdentifier
+                )
+                let matches = reminders.filter {
+                    containsRestoreMarker($0.notes, marker: marker)
+                }
+                guard matches.count == 1, let match = matches.first else {
+                    throw matches.isEmpty
+                        ? ReminderPrunerError.restoredReminderReadbackFailed
+                        : ReminderPrunerError.restoreReadbackAmbiguous
+                }
+                restoredIdentifiers[item.originalItemIdentifier] =
+                    match.calendarItemIdentifier
+            }
+            try localStore.recordRestoreReadback(
+                restoredIdentifiers,
+                at: backupURL
+            )
+        }
+
+        let restoredPairs = try restoreReadbackPairs(
+            items: items,
+            identifiers: restoredIdentifiers,
+            reminders: reminders
+        )
+        do {
+            for pair in restoredPairs {
+                ReminderBackupAdapter.restore(pair.item, into: pair.reminder)
+                try eventStore.save(pair.reminder, commit: false)
             }
             try eventStore.commit()
         } catch {
@@ -258,32 +515,25 @@ public final class ReminderPruner {
             throw error
         }
 
-        let createdIdentifiers = Set(
-            created.map(\.calendarItemIdentifier)
-        )
         let restoredCalendarIdentifier = calendar.calendarIdentifier
+        let restoredSourceIdentifier = calendar.source.sourceIdentifier
         eventStore.reset()
-        guard
-            let refreshedCalendar = eventStore.calendar(
-                withIdentifier: restoredCalendarIdentifier
-            )
-        else {
-            throw ReminderPrunerError.restoredReminderReadbackFailed
-        }
-        let refreshed = await fetchReminders(in: refreshedCalendar)
-        let restored = refreshed.filter {
-            createdIdentifiers.contains($0.calendarItemIdentifier)
-        }
-        guard restored.count == backup.items.count else {
-            throw ReminderPrunerError.restoredReminderReadbackFailed
-        }
-
+        let refreshedCalendar = try exactRestoreCalendar(
+            identifier: restoredCalendarIdentifier,
+            sourceIdentifier: restoredSourceIdentifier
+        )
+        let refreshed = try await fetchReminders(in: refreshedCalendar)
+        let finalPairs = try restoreReadbackPairs(
+            items: items,
+            identifiers: restoredIdentifiers,
+            reminders: refreshed
+        )
         var ledger = try localStore.loadLedger()
         let graceUntil = now.addingTimeInterval(
             max(configuration.restoreGraceInterval, 86_400)
         )
-        for reminder in restored {
-            let presence = restoredSourcePresence(notes: reminder.notes)
+        for pair in finalPairs {
+            let reminder = pair.reminder
             let identifier = reminder.calendarItemIdentifier
             ledger.entries[identifier] = ReminderPruneLedgerEntry(
                 firstSeen: now,
@@ -291,10 +541,10 @@ public final class ReminderPruner {
                     reminder: reminder,
                     targetCalendarIdentifier:
                         refreshedCalendar.calendarIdentifier,
-                    presence: presence
+                    presence: pair.item.taskPresence
                 ),
                 calendarIdentifier: refreshedCalendar.calendarIdentifier,
-                rulesVersion: ReminderPruneStateMachine.rulesVersion,
+                rulesVersion: backup.rulesVersion,
                 graceUntil: graceUntil
             )
         }
@@ -303,7 +553,7 @@ public final class ReminderPruner {
 
         var counts = ReminderPruneCounts()
         counts.scanned = refreshed.count
-        counts.restored = restored.count
+        counts.restored = finalPairs.count
         log(summary(prefix: "清理恢复", counts: counts))
         return counts
     }
@@ -314,35 +564,174 @@ public final class ReminderPruner {
     private let log: @Sendable (String) -> Void
     private let logError: @Sendable (String) -> Void
 
+    private var operationKey: String {
+        configuration.localRoot.standardizedFileURL
+            .resolvingSymlinksInPath().path
+    }
+
     private func targetCalendar() -> EKCalendar? {
         eventStore.calendars(for: .reminder).first {
             $0.title == configuration.listName
         }
     }
 
-    private func createTargetCalendar(
-        title: String,
-        sourceIdentifier: String
+    private func reconcileUnresolvedBackup(
+        targetCalendar: EKCalendar,
+        reminders: [EKReminder]
+    ) throws {
+        guard
+            let (url, backup) = try localStore.latestUnrestoredBackup(),
+            backup.actuallyDeletedIdentifiers == nil
+        else {
+            return
+        }
+        guard
+            backup.targetCalendarIdentifier
+                == targetCalendar.calendarIdentifier,
+            backup.targetSourceIdentifier
+                == targetCalendar.source.sourceIdentifier
+        else {
+            throw ReminderPrunerError.deletionOutcomeUnresolved
+        }
+        let remaining = Set(
+            reminders.map(\.calendarItemIdentifier)
+        )
+        let attempted = Set(
+            backup.items.map(\.originalItemIdentifier)
+        )
+        try localStore.recordActuallyDeletedIdentifiers(
+            attempted.subtracting(remaining).sorted(),
+            at: url
+        )
+    }
+
+    private func restoreTargetCalendar(
+        for backup: ReminderPruneBackupBatch
     ) throws -> EKCalendar {
+        let calendars = eventStore.calendars(for: .reminder)
+        if let exact = calendars.first(where: {
+            $0.calendarIdentifier == backup.targetCalendarIdentifier
+                && $0.source.sourceIdentifier
+                    == backup.targetSourceIdentifier
+        }) {
+            return exact
+        }
+        let named = calendars.filter {
+            $0.title == backup.targetCalendarTitle
+                && $0.source.sourceIdentifier
+                    == backup.targetSourceIdentifier
+        }
+        guard named.count <= 1 else {
+            throw ReminderPrunerError.ambiguousTargetCalendar
+        }
+        if let existing = named.first {
+            return existing
+        }
         guard let source = eventStore.sources.first(where: {
-            $0.sourceIdentifier == sourceIdentifier
+            $0.sourceIdentifier == backup.targetSourceIdentifier
         }) else {
             throw ReminderPrunerError.backupReminderSourceUnavailable
         }
         let calendar = EKCalendar(for: .reminder, eventStore: eventStore)
-        calendar.title = title
+        calendar.title = backup.targetCalendarTitle
         calendar.source = source
         try eventStore.saveCalendar(calendar, commit: true)
         return calendar
     }
 
-    private func fetchReminders(in calendar: EKCalendar) async -> [EKReminder] {
+    private func exactRestoreCalendar(
+        identifier: String,
+        sourceIdentifier: String
+    ) throws -> EKCalendar {
+        guard let calendar = eventStore.calendars(for: .reminder).first(where: {
+            $0.calendarIdentifier == identifier
+                && $0.source.sourceIdentifier == sourceIdentifier
+        }) else {
+            throw ReminderPrunerError.restoredReminderReadbackFailed
+        }
+        return calendar
+    }
+
+    private func fetchReminders(
+        in calendar: EKCalendar
+    ) async throws -> [EKReminder] {
         let predicate = eventStore.predicateForReminders(in: [calendar])
-        return await withCheckedContinuation { continuation in
+        return try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[EKReminder], Error>) in
             _ = eventStore.fetchReminders(matching: predicate) { reminders in
-                continuation.resume(returning: reminders ?? [])
+                guard let reminders else {
+                    continuation.resume(
+                        throwing: ReminderPrunerError.reminderFetchFailed
+                    )
+                    return
+                }
+                continuation.resume(returning: reminders)
             }
         }
+    }
+
+    private func restoreReadbackPairs(
+        items: [ReminderPruneBackupItem],
+        identifiers: [String: String],
+        reminders: [EKReminder]
+    ) throws -> [
+        (item: ReminderPruneBackupItem, reminder: EKReminder)
+    ] {
+        guard
+            Set(identifiers.keys)
+                == Set(items.map(\.originalItemIdentifier))
+        else {
+            throw ReminderPrunerError.restoredReminderReadbackFailed
+        }
+        var remindersByIdentifier: [String: EKReminder] = [:]
+        for reminder in reminders {
+            let identifier = reminder.calendarItemIdentifier
+            guard remindersByIdentifier[identifier] == nil else {
+                throw ReminderPrunerError.restoreReadbackAmbiguous
+            }
+            remindersByIdentifier[identifier] = reminder
+        }
+        return try items.map { item in
+            guard
+                let restoredIdentifier =
+                    identifiers[item.originalItemIdentifier],
+                let reminder =
+                    remindersByIdentifier[restoredIdentifier]
+            else {
+                throw ReminderPrunerError.restoredReminderReadbackFailed
+            }
+            return (item, reminder)
+        }
+    }
+
+    private func restoreMarker(
+        backupIdentifier: UUID,
+        attemptIdentifier: UUID,
+        originalItemIdentifier: String
+    ) -> String {
+        let itemHash = SHA256.hash(
+            data: Data(originalItemIdentifier.utf8)
+        ).map { String(format: "%02x", $0) }.joined()
+        return "TaskForge-Prune-Restore-ID: "
+            + "\(backupIdentifier.uuidString):"
+            + "\(attemptIdentifier.uuidString):\(itemHash)"
+    }
+
+    private func containsRestoreMarker(
+        _ notes: String?,
+        marker: String
+    ) -> Bool {
+        notes?.components(separatedBy: "\n").contains(marker) == true
+    }
+
+    private func addingRestoreMarker(
+        to notes: String?,
+        marker: String
+    ) -> String {
+        guard let notes, !notes.isEmpty else {
+            return marker
+        }
+        return notes + "\n" + marker
     }
 
     private func observation(
@@ -392,7 +781,7 @@ public final class ReminderPruner {
             let reference = TaskSourceReference.decode(from: notes),
             let path = reference.task.filePath
         else {
-            return .indeterminate
+            return .absent
         }
 
         let vaultURL = URL(
@@ -430,25 +819,6 @@ public final class ReminderPruner {
         case .indeterminate:
             return .indeterminate
         }
-    }
-
-    private func restoredSourcePresence(
-        notes: String?
-    ) -> TaskForgeReminderPresence {
-        guard
-            let marker = TaskSyncMarker.extract(from: notes),
-            let decoded = TaskSyncMarker.decode(marker)
-        else {
-            return .indeterminate
-        }
-        return sourcePresence(
-            notes: notes,
-            snapshot: TaskForgeSnapshot(
-                version: 6,
-                vaultPath: decoded.vaultPath,
-                tasks: []
-            )
-        )
     }
 
     private func fingerprint(
