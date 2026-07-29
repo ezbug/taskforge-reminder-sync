@@ -132,6 +132,12 @@ Markdown task line, TaskNotes file or any other TaskForge source item.
 8. Stage EventKit removals, commit once, then refetch actual state. Record and
    report what was actually deleted rather than assuming atomic success.
 
+If a process stops after EventKit commit but before the actual outcome is
+persisted, the next advance pass uses
+`latestUnresolvedDeletionBackup()` to select the newest unresolved batch,
+refetches the target list and records the observed result. An empty result is
+preserved but is neither unresolved nor restorable afterward.
+
 `--prune-dry-run` uses a read-only ledger load and never creates or modifies
 the ledger, backup directory, hash salt or EventKit items. `--prune-once`,
 `--sync` and each watcher pass advance the same state machine.
@@ -149,7 +155,8 @@ categories, never reminder content, source paths or raw identifiers.
 
 ## Restore flow
 
-`--restore-last-prune` selects by creation time the newest un-restored backup
+`--restore-last-prune` uses `latestRestorableBackup()` to select by creation
+time the newest un-restored backup
 whose actual-deletion identifiers have been parsed and are non-empty. A newer
 backup with an unresolved result or an empty actual-deletion set remains on
 disk but cannot block an older real deletion batch and cannot be marked

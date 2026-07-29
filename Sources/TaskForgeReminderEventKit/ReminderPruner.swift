@@ -463,7 +463,7 @@ public final class ReminderPruner {
         defer { operationLock.unlock() }
 
         guard let (backupURL, originalBackup) =
-            try localStore.latestUnrestoredBackup()
+            try localStore.latestRestorableBackup()
         else {
             return ReminderPruneCounts()
         }
@@ -475,13 +475,10 @@ public final class ReminderPruner {
             throw ReminderPrunerError.backupSchemaVersionUnsupported
         }
         guard
-            let items = originalBackup.actuallyDeletedItems
+            let items = originalBackup.actuallyDeletedItems,
+            !items.isEmpty
         else {
             throw ReminderPrunerError.deletionOutcomeUnresolved
-        }
-        if items.isEmpty {
-            try localStore.markRestored(at: backupURL, date: now)
-            return ReminderPruneCounts()
         }
 
         let backup = try localStore.beginRestoreAttempt(at: backupURL)
@@ -662,8 +659,8 @@ public final class ReminderPruner {
         reminders: [EKReminder]
     ) throws {
         guard
-            let (url, backup) = try localStore.latestUnrestoredBackup(),
-            backup.actuallyDeletedIdentifiers == nil
+            let (url, backup) =
+                try localStore.latestUnresolvedDeletionBackup()
         else {
             return
         }

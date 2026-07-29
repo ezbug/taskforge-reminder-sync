@@ -945,7 +945,10 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     public func saveLedger(_ ledger: ReminderPruneLedger) throws
     public func saveBackup(_ batch: ReminderPruneBackupBatch) throws -> URL
     public func loadBackup(at url: URL) throws -> ReminderPruneBackupBatch
-    public func latestUnrestoredBackup() throws -> (URL, ReminderPruneBackupBatch)?
+    public func latestUnresolvedDeletionBackup() throws
+        -> (URL, ReminderPruneBackupBatch)?
+    public func latestRestorableBackup() throws
+        -> (URL, ReminderPruneBackupBatch)?
     public func markRestored(at url: URL, date: Date) throws
     public func loadOrCreateHashSalt() throws -> Data
 }
@@ -1138,13 +1141,16 @@ public final class ReminderPruner {
    再次原子保存；仍存在的 ready entry 保留以便下轮重试。
 10. commit 抛错时同样重新读取目标列表，按实际存在情况统计，不能假定批次
     全成或全败；备份始终保留。
-11. 日志只用本机盐对 EventKit ID 做 SHA-256 后截取前 12 位。
+11. 下轮 `advance` 用 `latestUnresolvedDeletionBackup()` 找到尚未记录实际结果
+    的最新备份，回读目标列表并固化实际删除 ID；空结果保留但不进入恢复。
+12. 日志只用本机盐对 EventKit ID 做 SHA-256 后截取前 12 位。
 
 - [ ] **步骤 4：实现恢复与 24 小时宽限**
 
 `restoreLast`：
 
-1. 读取 `latestUnrestoredBackup()`；
+1. 读取 `latestRestorableBackup()`；只选择尚未恢复且实际删除结果非空的最新
+   批次，跳过 unresolved、空结果和已恢复备份；
 2. 查找目标列表；不存在时用同一 EventKit source 创建；
 3. 为每个备份项目创建 `EKReminder` 并调用 adapter；
 4. commit 成功后重新读取恢复项，按与 advance 相同的函数计算 fingerprint，

@@ -1966,6 +1966,141 @@ private let tests: [TestCase] = [
             "read-only ledger load must not create the ledger"
         )
     }),
+    ("unresolved selection chooses the newest unresolved outcome", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        _ = try store.saveBackup(
+            pruneBackupFixture(
+                identifier: UUID(
+                    uuidString: "00000000-0000-0000-0000-000000000201"
+                )!,
+                createdAt: Date(timeIntervalSince1970: 10)
+            )
+        )
+        let newerUnresolved = pruneBackupFixture(
+            identifier: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000202"
+            )!,
+            createdAt: Date(timeIntervalSince1970: 20)
+        )
+        _ = try store.saveBackup(newerUnresolved)
+        _ = try store.saveBackup(
+            pruneBackupFixture(
+                identifier: UUID(
+                    uuidString: "00000000-0000-0000-0000-000000000203"
+                )!,
+                createdAt: Date(timeIntervalSince1970: 30),
+                actuallyDeletedIdentifiers: ["item"]
+            )
+        )
+        _ = try store.saveBackup(
+            pruneBackupFixture(
+                identifier: UUID(
+                    uuidString: "00000000-0000-0000-0000-000000000204"
+                )!,
+                createdAt: Date(timeIntervalSince1970: 40),
+                actuallyDeletedIdentifiers: []
+            )
+        )
+        let restoredURL = try store.saveBackup(
+            pruneBackupFixture(
+                identifier: UUID(
+                    uuidString: "00000000-0000-0000-0000-000000000205"
+                )!,
+                createdAt: Date(timeIntervalSince1970: 50),
+                actuallyDeletedIdentifiers: ["item"]
+            )
+        )
+        _ = try store.beginRestoreAttempt(at: restoredURL)
+        try store.recordRestoreReadback(
+            ["item": "restored-item"],
+            at: restoredURL
+        )
+        try store.markRestored(
+            at: restoredURL,
+            date: Date(timeIntervalSince1970: 60)
+        )
+
+        let selected = try requireValue(
+            try store.latestUnresolvedDeletionBackup(),
+            "unresolved deletion backup should be selected"
+        )
+        try require(
+            selected.1.identifier == newerUnresolved.identifier,
+            "selection did not choose the newest unresolved outcome"
+        )
+    }),
+    ("unresolved selection ignores empty resolved and restorable outcomes", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        _ = try store.saveBackup(
+            pruneBackupFixture(
+                identifier: UUID(
+                    uuidString: "00000000-0000-0000-0000-000000000211"
+                )!,
+                createdAt: Date(timeIntervalSince1970: 10),
+                actuallyDeletedIdentifiers: []
+            )
+        )
+        _ = try store.saveBackup(
+            pruneBackupFixture(
+                identifier: UUID(
+                    uuidString: "00000000-0000-0000-0000-000000000212"
+                )!,
+                createdAt: Date(timeIntervalSince1970: 20),
+                actuallyDeletedIdentifiers: ["item"]
+            )
+        )
+
+        try require(
+            try store.latestUnresolvedDeletionBackup() == nil,
+            "resolved outcomes must not be selected as unresolved"
+        )
+    }),
+    ("unresolved outcome settles into a preserved restorable backup", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let batch = pruneBackupFixture(
+            identifier: UUID(
+                uuidString: "00000000-0000-0000-0000-000000000221"
+            )!,
+            createdAt: Date(timeIntervalSince1970: 10)
+        )
+        let url = try store.saveBackup(batch)
+        let unresolved = try requireValue(
+            try store.latestUnresolvedDeletionBackup(),
+            "unresolved deletion outcome should be discoverable"
+        )
+        try require(
+            unresolved.1.identifier == batch.identifier,
+            "unresolved selection returned another backup"
+        )
+
+        try store.recordActuallyDeletedIdentifiers(["item"], at: url)
+
+        try require(
+            try store.latestUnresolvedDeletionBackup() == nil,
+            "settled outcome remained unresolved"
+        )
+        let restorable = try requireValue(
+            try store.latestRestorableBackup(),
+            "settled non-empty deletion should become restorable"
+        )
+        try require(
+            restorable.1.identifier == batch.identifier,
+            "settlement replaced or lost the original backup"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: url.path),
+            "settlement must preserve the backup file"
+        )
+    }),
     ("restore selection skips a newer unresolved backup", {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1989,7 +2124,7 @@ private let tests: [TestCase] = [
         )
 
         let selected = try requireValue(
-            try store.latestUnrestoredBackup(),
+            try store.latestRestorableBackup(),
             "older real deletion backup should remain restorable"
         )
         try require(
@@ -2021,7 +2156,7 @@ private let tests: [TestCase] = [
         )
 
         let selected = try requireValue(
-            try store.latestUnrestoredBackup(),
+            try store.latestRestorableBackup(),
             "older real deletion backup should remain restorable"
         )
         try require(
@@ -2053,7 +2188,7 @@ private let tests: [TestCase] = [
         )
 
         try require(
-            try store.latestUnrestoredBackup() == nil,
+            try store.latestRestorableBackup() == nil,
             "unresolved or empty deletion results are not restorable"
         )
         for url in [unresolvedURL, emptyURL] {
@@ -2101,7 +2236,7 @@ private let tests: [TestCase] = [
         _ = try store.saveBackup(newer)
 
         let selected = try requireValue(
-            try store.latestUnrestoredBackup(),
+            try store.latestRestorableBackup(),
             "real deletion backup should be restorable"
         )
         try require(
@@ -2142,7 +2277,7 @@ private let tests: [TestCase] = [
         )
 
         let selected = try requireValue(
-            try store.latestUnrestoredBackup(),
+            try store.latestRestorableBackup(),
             "older unrestored deletion backup should remain available"
         )
         try require(
@@ -2211,6 +2346,79 @@ private let tests: [TestCase] = [
                 "unexpected restore overwrite error"
             )
         }
+    }),
+    ("restored backup rejects every further state mutation", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let url = try store.saveBackup(
+            pruneBackupFixture(
+                actuallyDeletedIdentifiers: ["item"]
+            )
+        )
+        _ = try store.beginRestoreAttempt(at: url)
+        try store.recordRestoreReadback(
+            ["item": "restored-item"],
+            at: url
+        )
+        let restoredAt = Date(timeIntervalSince1970: 30)
+        try store.markRestored(at: url, date: restoredAt)
+
+        do {
+            try store.recordActuallyDeletedIdentifiers(["item"], at: url)
+            throw TestFailure(
+                description: "restored deletion outcome was accepted"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .invalidBackup,
+                "unexpected restored outcome mutation error"
+            )
+        }
+        do {
+            _ = try store.beginRestoreAttempt(at: url)
+            throw TestFailure(
+                description: "restored backup began another attempt"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .invalidBackup,
+                "unexpected restored begin mutation error"
+            )
+        }
+        do {
+            try store.recordRestoreReadback(
+                ["item": "restored-item"],
+                at: url
+            )
+            throw TestFailure(
+                description: "restored backup accepted another readback"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .invalidBackup,
+                "unexpected restored readback mutation error"
+            )
+        }
+        do {
+            try store.markRestored(
+                at: url,
+                date: Date(timeIntervalSince1970: 40)
+            )
+            throw TestFailure(
+                description: "restored backup was marked twice"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .invalidBackup,
+                "unexpected repeated restored mutation error"
+            )
+        }
+        try require(
+            try store.loadBackup(at: url).restoredAt == restoredAt,
+            "rejected mutations changed the restored backup"
+        )
     }),
     ("prune local store writes private ledger and verified backup", {
         let root = FileManager.default.temporaryDirectory
@@ -2369,7 +2577,7 @@ private let tests: [TestCase] = [
             ofItemAtPath: backupURL.path
         )
         do {
-            _ = try store.latestUnrestoredBackup()
+            _ = try store.latestRestorableBackup()
             throw TestFailure(description: "corrupt backup was ignored")
         } catch let error as ReminderPruneStoreError {
             try require(error == .checksumMismatch, "unexpected corrupt backup error")
@@ -2394,7 +2602,7 @@ private let tests: [TestCase] = [
             "restored backup must still verify"
         )
         try require(
-            try store.latestUnrestoredBackup() == nil,
+            try store.latestRestorableBackup() == nil,
             "restored backup must not remain latest unrestored"
         )
 

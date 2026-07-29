@@ -335,7 +335,32 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         return batch
     }
 
-    public func latestUnrestoredBackup() throws -> (URL, ReminderPruneBackupBatch)? {
+    public func latestUnresolvedDeletionBackup() throws
+        -> (URL, ReminderPruneBackupBatch)?
+    {
+        try latestBackup {
+            $0.restoredAt == nil
+                && $0.actuallyDeletedIdentifiers == nil
+        }
+    }
+
+    public func latestRestorableBackup() throws
+        -> (URL, ReminderPruneBackupBatch)?
+    {
+        try latestBackup {
+            guard
+                $0.restoredAt == nil,
+                let deletedItems = $0.actuallyDeletedItems
+            else {
+                return false
+            }
+            return !deletedItems.isEmpty
+        }
+    }
+
+    private func latestBackup(
+        where isEligible: (ReminderPruneBackupBatch) -> Bool
+    ) throws -> (URL, ReminderPruneBackupBatch)? {
         try ensureDirectory(rootURL)
         let backups = try backupsURL()
         let urls: [URL]
@@ -353,15 +378,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             (url, try loadBackup(at: url))
         }
         return batches
-            .filter {
-                guard
-                    $0.1.restoredAt == nil,
-                    let deletedItems = $0.1.actuallyDeletedItems
-                else {
-                    return false
-                }
-                return !deletedItems.isEmpty
-            }
+            .filter { isEligible($0.1) }
             .sorted {
                 if $0.1.createdAt == $1.1.createdAt {
                     return $0.0.lastPathComponent > $1.0.lastPathComponent
@@ -374,8 +391,11 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     public func markRestored(at url: URL, date: Date) throws {
         var batch = try loadBackup(at: url)
         guard
-            let deletedItems = batch.actuallyDeletedItems,
-            !deletedItems.isEmpty
+            batch.restoredAt == nil,
+            batch.restoreAttemptIdentifier != nil,
+            let deleted = batch.actuallyDeletedIdentifiers,
+            !deleted.isEmpty,
+            Set(batch.restoredItemIdentifiers.keys) == Set(deleted)
         else {
             throw ReminderPruneStoreError.invalidBackup
         }
@@ -388,6 +408,13 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         at url: URL
     ) throws {
         var batch = try loadBackup(at: url)
+        guard
+            batch.restoredAt == nil,
+            batch.restoreAttemptIdentifier == nil,
+            batch.restoredItemIdentifiers.isEmpty
+        else {
+            throw ReminderPruneStoreError.invalidBackup
+        }
         let original = Set(batch.items.map(\.originalItemIdentifier))
         let deleted = Set(identifiers)
         guard deleted.isSubset(of: original) else {
@@ -408,6 +435,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     ) throws -> ReminderPruneBackupBatch {
         var batch = try loadBackup(at: url)
         guard
+            batch.restoredAt == nil,
             let deletedItems = batch.actuallyDeletedItems,
             !deletedItems.isEmpty
         else {
@@ -426,6 +454,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     ) throws {
         var batch = try loadBackup(at: url)
         guard
+            batch.restoredAt == nil,
             batch.restoreAttemptIdentifier != nil,
             let deleted = batch.actuallyDeletedIdentifiers,
             !deleted.isEmpty,
