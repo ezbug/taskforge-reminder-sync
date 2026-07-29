@@ -185,6 +185,35 @@ private func taskStoreFixture() -> Data {
     )
 }
 
+private func pruneBackupFixture() -> ReminderPruneBackupBatch {
+    ReminderPruneBackupBatch(
+        identifier: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+        createdAt: Date(timeIntervalSince1970: 20),
+        targetCalendarIdentifier: "calendar",
+        targetCalendarTitle: "TaskForge 今日",
+        items: [
+            ReminderPruneBackupItem(
+                originalItemIdentifier: "item",
+                title: "普通提醒",
+                notes: "本地测试",
+                url: URL(string: "taskforge-test://item"),
+                priority: 0,
+                dueDateComponents: DateComponents(
+                    calendar: Calendar(identifier: .gregorian),
+                    timeZone: TimeZone(secondsFromGMT: 0),
+                    year: 2026,
+                    month: 7,
+                    day: 30
+                ),
+                startDateComponents: nil,
+                alarms: [],
+                recurrenceRules: []
+            )
+        ],
+        restoredAt: nil
+    )
+}
+
 private let tests: [TestCase] = [
     ("TaskForge v6 MessagePack store decodes task records", {
         let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
@@ -1190,6 +1219,57 @@ private let tests: [TestCase] = [
             "completed reminder must revoke its candidate"
         )
         try require(revoked.readyIdentifiers.isEmpty, "revoked item must not delete")
+    }),
+    ("prune local store writes private ledger and verified backup", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let ledger = ReminderPruneLedger(entries: [
+            "item": ReminderPruneLedgerEntry(
+                firstSeen: Date(timeIntervalSince1970: 10),
+                fingerprint: "fingerprint",
+                calendarIdentifier: "calendar",
+                rulesVersion: 1,
+                graceUntil: nil
+            )
+        ])
+        try store.saveLedger(ledger)
+        try require(try store.loadLedger() == ledger, "ledger round-trip failed")
+
+        let permissions = try requireValue(
+            FileManager.default.attributesOfItem(
+                atPath: store.ledgerURL.path
+            )[.posixPermissions] as? NSNumber,
+            "permissions missing"
+        )
+        try require(permissions.intValue & 0o777 == 0o600, "ledger must be 0600")
+
+        let rootPermissions = try requireValue(
+            FileManager.default.attributesOfItem(
+                atPath: root.path
+            )[.posixPermissions] as? NSNumber,
+            "root permissions missing"
+        )
+        try require(rootPermissions.intValue & 0o777 == 0o700, "root must be 0700")
+
+        let batch = pruneBackupFixture()
+        let url = try store.saveBackup(batch)
+        try require(try store.loadBackup(at: url) == batch, "backup verification failed")
+    }),
+    ("prune local store rejects a modified backup", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let url = try store.saveBackup(pruneBackupFixture())
+        try Data("tampered".utf8).write(to: url, options: .atomic)
+        do {
+            _ = try store.loadBackup(at: url)
+            throw TestFailure(description: "tampered backup was accepted")
+        } catch let error as ReminderPruneStoreError {
+            try require(error == .checksumMismatch, "unexpected store error")
+        }
     })
 ]
 
