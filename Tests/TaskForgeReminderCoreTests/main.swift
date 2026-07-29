@@ -780,6 +780,80 @@ private let tests: [TestCase] = [
             "completed historical source should be recognized"
         )
     }),
+    ("source presence confirms exact and uniquely moved inline tasks", {
+        let task = TaskForgeTask(
+            identifier: "inline",
+            title: "保留任务",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/note.md",
+            sourceType: "markdownInline",
+            originalLine: "- [ ] 保留任务",
+            lineNumber: 2
+        )
+        try require(
+            TaskSourcePresenceInspector.inspect(
+                task: task,
+                contents: "heading\n- [ ] 保留任务\n"
+            ) == .present,
+            "exact source line should be present"
+        )
+        try require(
+            TaskSourcePresenceInspector.inspect(
+                task: task,
+                contents: "- [ ] 保留任务\nheading\n"
+            ) == .present,
+            "uniquely moved source line should be present"
+        )
+    }),
+    ("source presence distinguishes absent from ambiguous", {
+        let task = TaskForgeTask(
+            identifier: "inline",
+            title: "保留任务",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/note.md",
+            sourceType: "markdownInline",
+            originalLine: "- [ ] 保留任务",
+            lineNumber: 3
+        )
+        try require(
+            TaskSourcePresenceInspector.inspect(
+                task: task,
+                contents: "heading\nother\n"
+            ) == .absent,
+            "missing source line should be absent"
+        )
+        try require(
+            TaskSourcePresenceInspector.inspect(
+                task: task,
+                contents: "- [ ] 保留任务\n- [ ] 保留任务\n"
+            ) == .indeterminate,
+            "ambiguous source lines must fail closed"
+        )
+    }),
+    ("source presence protects an existing TaskNotes file", {
+        let task = TaskForgeTask(
+            identifier: "note",
+            title: "任务笔记",
+            status: "todo",
+            priority: nil,
+            scheduled: nil,
+            filePath: "/vault/TaskNotes/任务.md",
+            sourceType: "taskNotes",
+            originalLine: "tasknotes:{}",
+            lineNumber: 1
+        )
+        try require(
+            TaskSourcePresenceInspector.inspect(
+                task: task,
+                contents: "---\nstatus: open\n---\n"
+            ) == .present,
+            "readable TaskNotes source should be present"
+        )
+    }),
     ("prune policy protects non-target, completed and important reminders", {
         let target = "calendar-target"
         let protected = [

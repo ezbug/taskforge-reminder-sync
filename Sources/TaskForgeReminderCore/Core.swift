@@ -716,6 +716,43 @@ public enum TaskReminderDeduplicationPolicy {
     }
 }
 
+public enum TaskSourcePresence: String, Codable, Equatable, Sendable {
+    case present
+    case absent
+    case indeterminate
+}
+
+public enum TaskSourcePresenceInspector {
+    public static func inspect(
+        task: TaskForgeTask,
+        contents: String
+    ) -> TaskSourcePresence {
+        switch task.sourceType?.lowercased() {
+        case "markdowninline":
+            guard let originalLine = task.originalLine else {
+                return .indeterminate
+            }
+            let lines = contents.components(separatedBy: "\n")
+            if
+                let lineNumber = task.lineNumber,
+                lines.indices.contains(lineNumber - 1),
+                lines[lineNumber - 1] == originalLine
+            {
+                return .present
+            }
+            let matches = lines.filter { $0 == originalLine }.count
+            if matches == 1 {
+                return .present
+            }
+            return matches == 0 ? .absent : .indeterminate
+        case "tasknotes":
+            return .present
+        default:
+            return .indeterminate
+        }
+    }
+}
+
 public enum TaskCompletionSourceInspector {
     public static func isCompleted(
         task: TaskForgeTask,
