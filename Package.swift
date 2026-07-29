@@ -21,9 +21,16 @@ let package = Package(
         .target(
             name: "TaskForgeReminderCore"
         ),
+        .target(
+            name: "TaskForgeReminderEventKit",
+            dependencies: ["TaskForgeReminderCore"]
+        ),
         .executableTarget(
             name: "TaskForgeReminderSync",
-            dependencies: ["TaskForgeReminderCore"]
+            dependencies: [
+                "TaskForgeReminderCore",
+                "TaskForgeReminderEventKit"
+            ]
         ),
         .executableTarget(
             name: "TaskForgeReminderCoreTests",
