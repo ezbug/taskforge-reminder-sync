@@ -141,6 +141,12 @@ preserved but is neither unresolved nor restorable afterward.
 `--prune-dry-run` uses a read-only ledger load and never creates or modifies
 the ledger, backup directory, hash salt or EventKit items. `--prune-once`,
 `--sync` and each watcher pass advance the same state machine.
+Read-only loading requires an already-private `0700` runtime root and never
+changes an exposed legacy mode. Mutating paths share a Core initializer that
+can tighten a current-user-owned, non-symlink, ACL-free and non-group/world-
+writable root from `0755` to `0700`, then reopen and verify it with `fstat`.
+The same two-phase policy migrates the known source `Backups/` tree without
+changing file contents; directories become `0700` and regular files `0600`.
 
 Private pruning state defaults to:
 

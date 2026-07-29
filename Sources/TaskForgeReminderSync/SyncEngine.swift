@@ -123,15 +123,26 @@ enum TaskSourceWriter {
             throw SyncError.sourceEncodingInvalid(sourceURL.path)
         }
 
-        let backupDirectory = try makeBackupDirectory(root: backupRoot)
         let safeName = sourceURL.lastPathComponent.replacingOccurrences(of: "/", with: "_")
-        let backupURL = backupDirectory.appendingPathComponent(
-            "\(task.identifier)-\(safeName).bak"
-        )
+        let safeIdentifier = task.identifier.map { character in
+            character.isLetter || character.isNumber
+                || character == "-" || character == "_"
+                ? character
+                : "_"
+        }
+        let backupURL: URL
         do {
-            try originalData.write(to: backupURL, options: [.atomic])
+            backupURL = try TaskSourceBackupStore(
+                backupsRootURL: URL(
+                    fileURLWithPath: backupRoot,
+                    isDirectory: true
+                )
+            ).save(
+                originalData,
+                fileName: "\(String(safeIdentifier))-\(safeName).bak"
+            )
         } catch {
-            throw SyncError.backupFailed(backupURL.path)
+            throw SyncError.backupFailed(backupRoot)
         }
 
         try updatedData.write(to: sourceURL, options: [.atomic])
@@ -148,20 +159,6 @@ enum TaskSourceWriter {
             lineNumber: edit.lineNumber,
             updatedLine: edit.updatedLine
         )
-    }
-
-    private static func makeBackupDirectory(root: String) throws -> URL {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .autoupdatingCurrent
-        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
-        let directory = URL(fileURLWithPath: root, isDirectory: true)
-            .appendingPathComponent(formatter.string(from: Date()), isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
-        )
-        return directory
     }
 
     private static func sha256(_ data: Data) -> String {

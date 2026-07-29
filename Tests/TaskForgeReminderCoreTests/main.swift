@@ -124,6 +124,35 @@ private func waitForAsync<Value>(
     ).get()
 }
 
+private func addReadOnlyExtendedACL(to url: URL) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+    process.arguments = ["+a", "everyone allow read", url.path]
+    let standardError = Pipe()
+    process.standardError = standardError
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        let message = String(
+            data: standardError.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        throw TestFailure(
+            description: "could not create ACL fixture: \(message)"
+        )
+    }
+}
+
+private func permissions(at url: URL) throws -> Int {
+    let value = try requireValue(
+        FileManager.default.attributesOfItem(
+            atPath: url.path
+        )[.posixPermissions] as? NSNumber,
+        "permissions missing for \(url.lastPathComponent)"
+    )
+    return value.intValue & 0o777
+}
+
 private var shanghaiCalendar: Calendar {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
@@ -1416,6 +1445,28 @@ private let tests: [TestCase] = [
             )
         }
     }),
+    ("source presence rejects non-positive and overflowing line numbers", {
+        for lineNumber in [Int.min, 0, -1] {
+            let task = TaskForgeTask(
+                identifier: "invalid-line-\(lineNumber)",
+                title: "保留任务",
+                status: "todo",
+                priority: nil,
+                scheduled: nil,
+                filePath: "/vault/note.md",
+                sourceType: "markdownInline",
+                originalLine: "- [ ] 保留任务",
+                lineNumber: lineNumber
+            )
+            try require(
+                TaskSourcePresenceInspector.inspect(
+                    task: task,
+                    contents: "- [ ] 保留任务\n"
+                ) == .indeterminate,
+                "\(lineNumber) must fail closed without index arithmetic"
+            )
+        }
+    }),
     ("prune policy protects non-target, completed and important reminders", {
         let target = "calendar-target"
         let protected = [
@@ -1582,6 +1633,47 @@ private let tests: [TestCase] = [
             restarted.nextLedger.entries["external"]?.firstSeen
                 == now.addingTimeInterval(120),
             "changed item should receive a new firstSeen"
+        )
+    }),
+    ("prune state restarts when the calendar identifier changes", {
+        let now = Date(timeIntervalSince1970: 2_250)
+        let prior = ReminderPruneLedger(entries: [
+            "external": ReminderPruneLedgerEntry(
+                firstSeen: now.addingTimeInterval(-120),
+                fingerprint: "stable",
+                calendarIdentifier: "calendar-before",
+                rulesVersion: ReminderPruneStateMachine.rulesVersion,
+                graceUntil: nil
+            )
+        ])
+        let moved = ReminderPruneObservation(
+            itemIdentifier: "external",
+            calendarIdentifier: "calendar-after",
+            isCompleted: false,
+            priority: 0,
+            title: "普通提醒",
+            fingerprint: "stable",
+            taskPresence: .absent
+        )
+        let plan = ReminderPruneStateMachine.plan(
+            observations: [moved],
+            prior: prior,
+            targetCalendarIdentifier: "calendar-after",
+            now: now
+        )
+
+        try require(
+            plan.firstSeenIdentifiers == ["external"],
+            "calendar move must start a fresh confirmation window"
+        )
+        try require(
+            plan.readyIdentifiers.isEmpty,
+            "calendar move must not reuse the old ready state"
+        )
+        try require(
+            plan.nextLedger.entries["external"]?.calendarIdentifier
+                == "calendar-after",
+            "fresh state must record the current calendar"
         )
     }),
     ("prune state clamps custom confirmation intervals to sixty seconds", {
@@ -1964,6 +2056,61 @@ private let tests: [TestCase] = [
         try require(
             !FileManager.default.fileExists(atPath: store.ledgerURL.path),
             "read-only ledger load must not create the ledger"
+        )
+    }),
+    ("prune dry-run rejects an exposed root without changing it", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o755]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: root.path
+        )
+
+        do {
+            _ = try ReminderPruneLocalStore(rootURL: root)
+                .loadLedgerReadOnly()
+            throw TestFailure(
+                description: "read-only load accepted an unmigrated root"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .permissions,
+                "unexpected read-only exposed-root error"
+            )
+        }
+        try require(
+            try permissions(at: root) == 0o755,
+            "dry-run changed the root permissions"
+        )
+    }),
+    ("prune mutating load safely migrates an exposed root", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o755]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: root.path
+        )
+
+        try require(
+            try ReminderPruneLocalStore(rootURL: root).loadLedger()
+                == ReminderPruneLedger(),
+            "normal load should preserve an absent ledger"
+        )
+        try require(
+            try permissions(at: root) == 0o700,
+            "normal load did not migrate the root to 0700"
         )
     }),
     ("unresolved selection chooses the newest unresolved outcome", {
@@ -2474,6 +2621,221 @@ private let tests: [TestCase] = [
         try require(
             loadedBatch.items.first?.taskPresence == .absent,
             "backup task presence round-trip failed"
+        )
+    }),
+    ("runtime backup migration preserves content and normalizes permissions", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let backups = root.appendingPathComponent(
+            "Backups",
+            isDirectory: true
+        )
+        let legacyBatch = backups.appendingPathComponent(
+            "legacy-batch",
+            isDirectory: true
+        )
+        let sentinel = legacyBatch.appendingPathComponent("sentinel.bak")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: legacyBatch,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
+        for directory in [root, backups, legacyBatch] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: directory.path
+            )
+        }
+        let sentinelData = Data("legacy sentinel".utf8)
+        try sentinelData.write(to: sentinel)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: sentinel.path
+        )
+
+        let backupStore = TaskSourceBackupStore(backupsRootURL: backups)
+        let freshData = Data("fresh backup".utf8)
+        let fresh = try backupStore.save(
+            freshData,
+            fileName: "fresh.bak",
+            batchName: "fresh-batch"
+        )
+        let ledger = try ReminderPruneLocalStore(rootURL: root).loadLedger()
+
+        try require(
+            ledger == ReminderPruneLedger(),
+            "prune store could not load after source backup initialization"
+        )
+        try require(
+            try Data(contentsOf: sentinel) == sentinelData,
+            "legacy backup content changed during migration"
+        )
+        try require(
+            try Data(contentsOf: fresh) == freshData,
+            "new source backup content changed"
+        )
+        for directory in [
+            root,
+            backups,
+            legacyBatch,
+            fresh.deletingLastPathComponent()
+        ] {
+            try require(
+                try permissions(at: directory) == 0o700,
+                "\(directory.lastPathComponent) must be 0700"
+            )
+        }
+        for file in [sentinel, fresh] {
+            try require(
+                try permissions(at: file) == 0o600,
+                "\(file.lastPathComponent) must be 0600"
+            )
+        }
+    }),
+    ("runtime migration policy rejects a different owner", {
+        let metadata = PrivateRuntimeNodeSecurity(
+            ownerUID: 502,
+            permissions: 0o755,
+            kind: .directory,
+            hasExtendedACL: false
+        )
+        try require(
+            !PrivateRuntimeDirectoryPolicy.canMigrate(
+                metadata,
+                currentUserUID: 501,
+                expectedKind: .directory
+            ),
+            "a different owner must fail closed"
+        )
+    }),
+    ("runtime root migration rejects symlinks and writable modes", {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let target = container.appendingPathComponent(
+            "target",
+            isDirectory: true
+        )
+        let symlink = container.appendingPathComponent(
+            "runtime-link",
+            isDirectory: true
+        )
+        let writable = container.appendingPathComponent(
+            "runtime-writable",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: container) }
+        try FileManager.default.createDirectory(
+            at: target,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: target
+        )
+        try FileManager.default.createDirectory(
+            at: writable,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o770]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o770],
+            ofItemAtPath: writable.path
+        )
+
+        for root in [symlink, writable] {
+            do {
+                _ = try ReminderPruneLocalStore(rootURL: root).loadLedger()
+                throw TestFailure(
+                    description: "\(root.lastPathComponent) was migrated"
+                )
+            } catch let error as ReminderPruneStoreError {
+                try require(
+                    error == .permissions,
+                    "unexpected unsafe-root error"
+                )
+            }
+        }
+        try require(
+            try permissions(at: target) == 0o755,
+            "symlink target permissions changed"
+        )
+        try require(
+            try permissions(at: writable) == 0o770,
+            "writable root permissions changed"
+        )
+    }),
+    ("runtime backup migration rejects a symlink entry", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let backups = root.appendingPathComponent(
+            "Backups",
+            isDirectory: true
+        )
+        let target = root.appendingPathComponent("outside.bak")
+        let linked = backups.appendingPathComponent("linked.bak")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: backups,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
+        try Data("outside".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(
+            at: linked,
+            withDestinationURL: target
+        )
+
+        do {
+            _ = try TaskSourceBackupStore(backupsRootURL: backups).save(
+                Data("new".utf8),
+                fileName: "new.bak",
+                batchName: "new-batch"
+            )
+            throw TestFailure(
+                description: "symlinked legacy backup entry was accepted"
+            )
+        } catch let error as PrivateRuntimeDirectoryError {
+            try require(
+                error == .unsafeNode,
+                "unexpected backup-tree symlink error"
+            )
+        }
+        try require(
+            try Data(contentsOf: target) == Data("outside".utf8),
+            "symlink target content changed"
+        )
+    }),
+    ("runtime root migration rejects an extended ACL", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o755]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: root.path
+        )
+        try addReadOnlyExtendedACL(to: root)
+
+        do {
+            _ = try ReminderPruneLocalStore(rootURL: root).loadLedger()
+            throw TestFailure(
+                description: "extended ACL runtime root was accepted"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .permissions,
+                "unexpected ACL-root error"
+            )
+        }
+        try require(
+            try permissions(at: root) == 0o755,
+            "ACL rejection changed root permissions"
         )
     }),
     ("prune local store rejects a modified backup", {

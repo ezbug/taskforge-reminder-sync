@@ -120,9 +120,12 @@ macOS 会请求“提醒事项”访问权限。工具不需要“日历”权�
 - 清理备份：`~/Library/Application Support/TaskForgeReminderSync/PruneBackups/`
 - 清理日志匿名化盐：`~/Library/Application Support/TaskForgeReminderSync/PruneHashSalt`
 
-候选账本、清理备份和匿名化盐均为本机私有运行数据，文件权限为 `0600`
-（父目录为 `0700`），不会进入 Git 仓库。备份可能包含恢复提醒所需的标题、
-笔记、日期、闹钟、重复规则和原始系统标识，请像保护 Vault 一样保护该目录。
+候选账本、清理备份、源文件回写备份和匿名化盐均为本机私有运行数据：
+运行时根目录、`Backups/` 及批次目录为 `0700`，备份和状态文件为 `0600`，
+且不会进入 Git 仓库。普通写路径可把本人拥有、非 symlink、无扩展 ACL、
+group/world 不可写的旧 `0755` / `0644` 备份树安全收紧；其他异常权限会
+失败关闭。备份可能包含恢复提醒所需的标题、笔记、日期、闹钟、重复规则和
+原始系统标识，请像保护 Vault 一样保护该目录。
 
 ## 命令
 

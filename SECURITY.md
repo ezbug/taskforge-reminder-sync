@@ -45,6 +45,12 @@ Reminder pruning adds these fixed boundaries:
 - snapshot, source, permission, I/O, ledger, backup, EventKit timeout and
   ambiguous restore errors preserve data and fail closed;
 - `--prune-dry-run` never writes the ledger, backups, salt or reminders;
+- normal write paths only migrate an exposed legacy runtime root or known
+  `Backups/` tree after verifying current-user ownership, real directory /
+  regular-file types, no extended ACL and no group/world write bits; directories
+  become `0700`, files become `0600`, and descriptor metadata is rechecked;
+- symlinks, a different owner, ACLs and group/world-writable nodes are never
+  repaired automatically and remain fail-closed;
 - TaskForge reverse completion only changes a task to `done`; pruning never
   deletes or moves a TaskForge source task;
 - restoration skips unresolved, zero-deletion and already restored backups,

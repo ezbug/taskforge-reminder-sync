@@ -24,9 +24,12 @@ Pruning also needs private local state under:
 `~/Library/Application Support/TaskForgeReminderSync/`
 
 The directory must be accessible only to the current user (`0700`), while
-`PruneCandidates.json`, files below `PruneBackups/` and `PruneHashSalt` must be
-`0600`. If permissions are broader, the ledger is damaged, or a backup checksum
-does not verify, pruning fails closed and keeps the reminders.
+`PruneCandidates.json`, source backup files, files below `PruneBackups/` and
+`PruneHashSalt` must be `0600`. A normal mutating run may safely tighten an old
+user-owned `0755` runtime root and the known `Backups/` tree when every node is
+real, has no extended ACL and is not group/world writable. A symlink, different
+owner, ACL, group/world-writable mode, damaged ledger or checksum failure stays
+fail-closed and preserves the reminder.
 
 ## LaunchAgent is not running
 
@@ -107,6 +110,8 @@ Common safe reasons for retaining a reminder are:
 `--prune-dry-run` is strictly read-only: it does not create or change the
 candidate ledger, backup directory, hash salt or reminders. To advance state,
 use `--prune-once`, `--sync`, or let `--watch` complete another reconciliation.
+This also means dry-run never fixes an old `0755` runtime root: it reports an
+anonymous permission failure until a normal mutating run safely migrates it.
 
 ## Pruning reports an ambiguous list
 
@@ -159,8 +164,9 @@ Backups are stored below:
 
 `~/Library/Application Support/TaskForgeReminderSync/Backups/`
 
-Each run uses a timestamped directory. Compare the backup and current source
-before restoring. Stop the LaunchAgent first if manual restoration is needed.
+Each run uses a private `0700` timestamped/unique directory and writes `0600`
+files. Compare the backup and current source before restoring. Stop the
+LaunchAgent first if manual restoration is needed.
 
 This source-file backup is separate from `PruneBackups/`, which restores Apple
 reminders deleted by the pruning feature.

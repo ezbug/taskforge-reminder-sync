@@ -37,7 +37,8 @@ candidate fingerprints, rules versions and restore grace periods. Pruning
 backups contain the reminder fields needed for restoration, including titles,
 notes, dates, priority, alarms, recurrence data and original system
 identifiers. These are sensitive local runtime data. Their parent application
-support directory is restricted to the current user (`0700`).
+support directory, source-backup tree and batch directories are restricted to
+the current user (`0700`); backup and state files use `0600`.
 
 ## Data it does not send
 

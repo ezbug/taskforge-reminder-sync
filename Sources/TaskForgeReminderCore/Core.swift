@@ -729,12 +729,15 @@ public enum TaskSourcePresenceInspector {
     ) -> TaskSourcePresence {
         switch task.sourceType?.lowercased() {
         case "markdowninline":
-            guard let originalLine = task.originalLine else {
+            guard
+                let originalLine = task.originalLine,
+                let lineNumber = task.lineNumber,
+                lineNumber > 0
+            else {
                 return .indeterminate
             }
             let lines = contents.components(separatedBy: "\n")
             if
-                let lineNumber = task.lineNumber,
                 lines.indices.contains(lineNumber - 1),
                 lines[lineNumber - 1] == originalLine
             {

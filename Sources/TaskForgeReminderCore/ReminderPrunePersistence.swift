@@ -220,10 +220,17 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     public func loadLedgerReadOnly() throws -> ReminderPruneLedger {
-        guard try attributesIfItemExists(at: rootURL) != nil else {
-            return ReminderPruneLedger()
+        do {
+            guard
+                try PrivateRuntimeDirectory.validatePrivateRootReadOnly(
+                    at: rootURL
+                )
+            else {
+                return ReminderPruneLedger()
+            }
+        } catch {
+            throw ReminderPruneStoreError.permissions
         }
-        try ensurePermissions(of: rootURL, expected: 0o700)
         guard try itemExists(at: ledgerURL) else {
             return ReminderPruneLedger()
         }
@@ -517,6 +524,7 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     private func backupsURL() throws -> URL {
+        try ensureDirectory(rootURL)
         let url = rootURL.appendingPathComponent("PruneBackups", isDirectory: true)
         try ensureDirectory(url)
         return url.standardizedFileURL
@@ -600,68 +608,31 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
     }
 
     private func ensureDirectory(_ url: URL) throws {
-        if let attributes = try attributesIfItemExists(at: url) {
-            guard
-                attributes[.type] as? String
-                    == FileAttributeType.typeDirectory.rawValue
-            else {
-                throw ReminderPruneStoreError.permissions
+        do {
+            if url.standardizedFileURL == rootURL.standardizedFileURL {
+                try PrivateRuntimeDirectory.prepareRoot(at: url)
+            } else if try attributesIfItemExists(at: url) == nil {
+                try PrivateRuntimeDirectory.createPrivateDirectory(at: url)
+            } else {
+                try PrivateRuntimeDirectory.validatePrivateDirectory(at: url)
             }
-        } else {
-            do {
-                try fileManager.createDirectory(
-                    at: url,
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
-                )
-            } catch {
-                guard try attributesIfItemExists(at: url) != nil else {
-                    throw ReminderPruneStoreError.permissions
-                }
-            }
+        } catch {
+            throw ReminderPruneStoreError.permissions
         }
-        try ensurePermissions(of: url, expected: 0o700)
     }
 
     private func ensurePrivateFile(_ url: URL) throws {
-        try ensurePermissions(of: url, expected: 0o600)
-    }
-
-    private func ensurePermissions(of url: URL, expected: Int) throws {
-        guard let attributes = try attributesIfItemExists(at: url) else {
+        do {
+            try PrivateRuntimeDirectory.validatePrivateFile(at: url)
+        } catch {
             throw ReminderPruneStoreError.permissions
         }
-        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
-            ?? (attributes[.posixPermissions] as? Int)
-        guard let permissions, permissions & 0o777 == expected else {
-            throw ReminderPruneStoreError.permissions
-        }
-        try ensureOwnedByCurrentUser(url)
-        try ensureNoExtendedACL(url)
-    }
-
-    private func ensureOwnedByCurrentUser(_ url: URL) throws {
-        var status = stat()
-        guard lstat(url.path, &status) == 0, status.st_uid == getuid() else {
-            throw ReminderPruneStoreError.permissions
-        }
-    }
-
-    private func ensureNoExtendedACL(_ url: URL) throws {
-        guard let acl = acl_get_file(url.path, ACL_TYPE_EXTENDED) else {
-            guard errno == ENOENT else {
-                throw ReminderPruneStoreError.permissions
-            }
-            return
-        }
-        acl_free(UnsafeMutableRawPointer(acl))
-        throw ReminderPruneStoreError.permissions
     }
 
     private func openSaltLock(at url: URL) throws -> Int32 {
         let descriptor = open(
             url.path,
-            O_RDWR | O_CREAT | O_EXCL,
+            O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
             mode_t(0o600)
         )
         if descriptor >= 0 {
@@ -675,7 +646,10 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             throw ReminderPruneStoreError.permissions
         }
 
-        let existingDescriptor = open(url.path, O_RDWR)
+        let existingDescriptor = open(
+            url.path,
+            O_RDWR | O_NOFOLLOW | O_CLOEXEC
+        )
         guard existingDescriptor >= 0 else {
             throw ReminderPruneStoreError.permissions
         }
