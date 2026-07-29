@@ -1,5 +1,7 @@
+import CoreLocation
 import Dispatch
 import Darwin
+import EventKit
 import Foundation
 import TaskForgeReminderCore
 @testable import TaskForgeReminderEventKit
@@ -25,6 +27,45 @@ private func requireValue<T>(
         throw TestFailure(description: message)
     }
     return value
+}
+
+private final class AsyncTestResultBox<Value>: @unchecked Sendable {
+    func store(_ result: Result<Value, Error>) {
+        lock.lock()
+        self.result = result
+        lock.unlock()
+    }
+
+    func take() -> Result<Value, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return result
+    }
+
+    private let lock = NSLock()
+    private var result: Result<Value, Error>?
+}
+
+private func waitForAsync<Value>(
+    _ operation: @escaping @Sendable () async throws -> Value
+) throws -> Value {
+    let resultBox = AsyncTestResultBox<Value>()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task.detached {
+        do {
+            resultBox.store(.success(try await operation()))
+        } catch {
+            resultBox.store(.failure(error))
+        }
+        semaphore.signal()
+    }
+    guard semaphore.wait(timeout: .now() + 5) == .success else {
+        throw TestFailure(description: "async unit test timed out")
+    }
+    return try requireValue(
+        resultBox.take(),
+        "async unit test produced no result"
+    ).get()
 }
 
 private var shanghaiCalendar: Calendar {
@@ -284,6 +325,181 @@ private func taskForgeEntries(at url: URL) throws -> [String] {
 }
 
 private let tests: [TestCase] = [
+    ("reminder fetch timeout resolves once and ignores a late callback", {
+        do {
+            let _: Int = try waitForAsync {
+                try await ReminderFetchWaiter.wait(
+                    timeout: 0,
+                    scheduleTimeout: { _, timeout in
+                        timeout()
+                    },
+                    start: { completion in
+                        completion(.success(7))
+                    }
+                )
+            }
+            throw TestFailure(
+                description: "fetch timeout unexpectedly succeeded"
+            )
+        } catch ReminderPrunerError.reminderFetchFailed {
+            // Expected anonymous timeout after the late callback is ignored.
+        }
+    }),
+    ("reminder backup adapter round-trips every expressible field", {
+        let eventStore = EKEventStore()
+        let original = EKReminder(eventStore: eventStore)
+        original.title = "adapter fixture"
+        original.notes = "adapter notes"
+        original.url = URL(string: "taskforge-adapter-test://fixture")
+        original.priority = 5
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 9 * 3_600)!
+        original.dueDateComponents = DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            era: 1,
+            year: 2031,
+            month: 8,
+            day: 9,
+            hour: 10,
+            minute: 11,
+            second: 12
+        )
+        original.startDateComponents = DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            era: 1,
+            year: 2031,
+            month: 8,
+            day: 9,
+            hour: 9,
+            minute: 10,
+            second: 11
+        )
+
+        let absoluteAlarm = EKAlarm(
+            absoluteDate: Date(timeIntervalSince1970: 2_000_000_000)
+        )
+        let location = EKStructuredLocation(title: "adapter location")
+        location.geoLocation = CLLocation(
+            latitude: 31.2304,
+            longitude: 121.4737
+        )
+        location.radius = 125
+        absoluteAlarm.structuredLocation = location
+        absoluteAlarm.proximity = .enter
+        original.addAlarm(absoluteAlarm)
+        original.addAlarm(EKAlarm(relativeOffset: -1_800))
+
+        let recurrence = EKRecurrenceRule(
+            recurrenceWith: .yearly,
+            interval: 2,
+            daysOfTheWeek: [
+                EKRecurrenceDayOfWeek(
+                    dayOfTheWeek: .monday,
+                    weekNumber: 2
+                )
+            ],
+            daysOfTheMonth: [1, -1].map(NSNumber.init(value:)),
+            monthsOfTheYear: [1, 12].map(NSNumber.init(value:)),
+            weeksOfTheYear: [1, -1].map(NSNumber.init(value:)),
+            daysOfTheYear: [100, -1].map(NSNumber.init(value:)),
+            setPositions: [1, -1].map(NSNumber.init(value:)),
+            end: EKRecurrenceEnd(occurrenceCount: 7)
+        )
+        original.addRecurrenceRule(recurrence)
+
+        let captured = ReminderBackupAdapter.capture(
+            original,
+            taskPresence: .sourceConfirmed
+        )
+        let restored = EKReminder(eventStore: eventStore)
+        ReminderBackupAdapter.restore(captured, into: restored)
+        let roundTrip = ReminderBackupAdapter.capture(
+            restored,
+            taskPresence: .sourceConfirmed
+        )
+
+        try require(
+            roundTrip.title == captured.title
+                && roundTrip.notes == captured.notes
+                && roundTrip.url == captured.url
+                && roundTrip.priority == captured.priority,
+            "adapter changed scalar reminder fields"
+        )
+        try require(
+            roundTrip.dueDateComponents == captured.dueDateComponents
+                && roundTrip.startDateComponents
+                    == captured.startDateComponents,
+            "adapter changed date component fields"
+        )
+        try require(
+            roundTrip.alarms.count == captured.alarms.count,
+            "adapter changed alarm count"
+        )
+        let capturedAbsolute = try requireValue(
+            captured.alarms.first { $0.absoluteDate != nil },
+            "absolute alarm fixture was not captured"
+        )
+        let roundTripAbsolute = try requireValue(
+            roundTrip.alarms.first { $0.absoluteDate != nil },
+            "absolute alarm was not restored"
+        )
+        try require(
+            roundTripAbsolute.absoluteDate
+                == capturedAbsolute.absoluteDate,
+            "adapter changed absolute alarm date"
+        )
+        try require(
+            roundTripAbsolute.structuredLocation
+                == capturedAbsolute.structuredLocation,
+            "adapter changed structured alarm location"
+        )
+        try require(
+            roundTripAbsolute.proximityRawValue
+                == capturedAbsolute.proximityRawValue,
+            "adapter changed alarm proximity"
+        )
+        let capturedRelative = try requireValue(
+            captured.alarms.first { $0.absoluteDate == nil },
+            "relative alarm fixture was not captured"
+        )
+        let roundTripRelative = try requireValue(
+            roundTrip.alarms.first { $0.absoluteDate == nil },
+            "relative alarm was not restored"
+        )
+        try require(
+            roundTripRelative == capturedRelative,
+            "adapter changed relative alarm fields"
+        )
+        try require(
+            roundTrip.recurrenceRules == captured.recurrenceRules,
+            "adapter changed recurrence fields"
+        )
+        try require(
+            roundTrip.taskPresence == .sourceConfirmed
+                && captured.priority == 5
+                && captured.alarms.count == 2
+                && captured.alarms.contains {
+                    $0.absoluteDate != nil
+                        && $0.structuredLocation != nil
+                        && $0.proximityRawValue
+                            == EKAlarmProximity.enter.rawValue
+                }
+                && captured.recurrenceRules.first?.daysOfMonth
+                    == [1, -1]
+                && captured.recurrenceRules.first?.monthsOfYear
+                    == [1, 12]
+                && captured.recurrenceRules.first?.weeksOfYear
+                    == [1, -1]
+                && captured.recurrenceRules.first?.daysOfYear
+                    == [100, -1]
+                && captured.recurrenceRules.first?.setPositions
+                    == [1, -1],
+            "adapter fixture did not cover extended fields"
+        )
+    }),
     ("prune target calendar selection fails closed on ambiguity", {
         let missing: Int? = try ReminderPruner.uniqueTargetCalendarMatch([])
         try require(missing == nil, "zero matching calendars should be absent")

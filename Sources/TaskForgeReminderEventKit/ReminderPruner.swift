@@ -1,5 +1,6 @@
 import CryptoKit
 import Darwin
+import Dispatch
 import EventKit
 import Foundation
 import TaskForgeReminderCore
@@ -98,6 +99,61 @@ public enum ReminderPrunerError: Error, LocalizedError {
             return "恢复尝试的提醒回读不唯一，备份仍未消费。"
         case .restoredReminderReadbackFailed:
             return "恢复提交后未能回读全部新提醒，备份仍未消费。"
+        }
+    }
+}
+
+private final class ReminderFetchResolution<Value>: @unchecked Sendable {
+    init(_ continuation: CheckedContinuation<Value, Error>) {
+        self.continuation = continuation
+    }
+
+    func resolve(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard let continuation else {
+            lock.unlock()
+            return
+        }
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(with: result)
+    }
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+}
+
+enum ReminderFetchWaiter {
+    typealias TimeoutScheduler = @Sendable (
+        TimeInterval,
+        @escaping @Sendable () -> Void
+    ) -> Void
+
+    static func wait<Value>(
+        timeout: TimeInterval = 30,
+        scheduleTimeout: @escaping TimeoutScheduler = {
+            interval, timeout in
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + max(interval, 0),
+                execute: timeout
+            )
+        },
+        start: (
+            @escaping @Sendable (Result<Value, Error>) -> Void
+        ) -> Void
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            let resolution = ReminderFetchResolution<Value>(
+                continuation
+            )
+            scheduleTimeout(timeout) {
+                resolution.resolve(
+                    .failure(ReminderPrunerError.reminderFetchFailed)
+                )
+            }
+            start { result in
+                resolution.resolve(result)
+            }
         }
     }
 }
@@ -608,16 +664,16 @@ public final class ReminderPruner {
         in calendar: EKCalendar
     ) async throws -> [EKReminder] {
         let predicate = eventStore.predicateForReminders(in: [calendar])
-        return try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<[EKReminder], Error>) in
+        return try await ReminderFetchWaiter.wait(timeout: 30) {
+            completion in
             _ = eventStore.fetchReminders(matching: predicate) { reminders in
                 guard let reminders else {
-                    continuation.resume(
-                        throwing: ReminderPrunerError.reminderFetchFailed
+                    completion(
+                        .failure(ReminderPrunerError.reminderFetchFailed)
                     )
                     return
                 }
-                continuation.resume(returning: reminders)
+                completion(.success(reminders))
             }
         }
     }

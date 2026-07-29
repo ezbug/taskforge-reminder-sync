@@ -66,6 +66,132 @@ private struct RestoreExpectation {
     let recurrenceCount: Int
 }
 
+private struct TemporaryCalendarIdentifiers {
+    var target: String?
+    var other: String?
+
+    var all: [String] {
+        [target, other].compactMap { $0 }
+    }
+}
+
+private struct DateComponentsBaseline: Equatable {
+    init(_ components: DateComponents) {
+        calendarIdentifier = components.calendar?.identifier
+        timeZoneIdentifier = components.timeZone?.identifier
+        timeZoneSecondsFromGMT =
+            components.timeZone?.secondsFromGMT()
+        era = components.era
+        year = components.year
+        month = components.month
+        day = components.day
+        hour = components.hour
+        minute = components.minute
+        second = components.second
+        nanosecond = components.nanosecond
+        weekday = components.weekday
+        weekdayOrdinal = components.weekdayOrdinal
+        quarter = components.quarter
+        weekOfMonth = components.weekOfMonth
+        weekOfYear = components.weekOfYear
+        yearForWeekOfYear = components.yearForWeekOfYear
+        isLeapMonth = components.isLeapMonth
+    }
+
+    let calendarIdentifier: Calendar.Identifier?
+    let timeZoneIdentifier: String?
+    let timeZoneSecondsFromGMT: Int?
+    let era: Int?
+    let year: Int?
+    let month: Int?
+    let day: Int?
+    let hour: Int?
+    let minute: Int?
+    let second: Int?
+    let nanosecond: Int?
+    let weekday: Int?
+    let weekdayOrdinal: Int?
+    let quarter: Int?
+    let weekOfMonth: Int?
+    let weekOfYear: Int?
+    let yearForWeekOfYear: Int?
+    let isLeapMonth: Bool?
+}
+
+private struct ReminderFieldBaseline: Equatable {
+    init(_ reminder: EKReminder) {
+        title = reminder.title
+        notes = reminder.notes
+        url = reminder.url
+        priority = reminder.priority
+        isCompleted = reminder.isCompleted
+        dueDateComponents = reminder.dueDateComponents.map(
+            DateComponentsBaseline.init
+        )
+        startDateComponents = reminder.startDateComponents.map(
+            DateComponentsBaseline.init
+        )
+        alarms = (reminder.alarms ?? []).map { alarm in
+            let location = alarm.structuredLocation.map {
+                ReminderLocationBackup(
+                    title: $0.title ?? "",
+                    latitude: $0.geoLocation?.coordinate.latitude,
+                    longitude: $0.geoLocation?.coordinate.longitude,
+                    radius: $0.radius
+                )
+            }
+            return ReminderAlarmBackup(
+                absoluteDate: alarm.absoluteDate,
+                relativeOffset: alarm.absoluteDate == nil
+                    ? alarm.relativeOffset
+                    : nil,
+                structuredLocation: location,
+                proximityRawValue: alarm.proximity.rawValue
+            )
+        }
+        recurrenceRules = (reminder.recurrenceRules ?? []).map { rule in
+            let end = rule.recurrenceEnd
+            return ReminderRecurrenceBackup(
+                frequencyRawValue: rule.frequency.rawValue,
+                interval: rule.interval,
+                daysOfWeek: (rule.daysOfTheWeek ?? []).map {
+                    ReminderWeekdayBackup(
+                        dayOfTheWeekRawValue:
+                            $0.dayOfTheWeek.rawValue,
+                        weekNumber: $0.weekNumber
+                    )
+                },
+                daysOfMonth:
+                    (rule.daysOfTheMonth ?? []).map(\.intValue),
+                monthsOfYear:
+                    (rule.monthsOfTheYear ?? []).map(\.intValue),
+                weeksOfYear:
+                    (rule.weeksOfTheYear ?? []).map(\.intValue),
+                daysOfYear:
+                    (rule.daysOfTheYear ?? []).map(\.intValue),
+                setPositions:
+                    (rule.setPositions ?? []).map(\.intValue),
+                endDate: end?.endDate,
+                occurrenceCount: end.flatMap {
+                    $0.occurrenceCount > 0
+                        ? Int($0.occurrenceCount)
+                        : nil
+                }
+            )
+        }
+    }
+
+    let title: String?
+    let notes: String?
+    let url: URL?
+    let priority: Int
+    let isCompleted: Bool
+    let dueDateComponents: DateComponentsBaseline?
+    let startDateComponents: DateComponentsBaseline?
+    let alarms: [ReminderAlarmBackup]
+    let recurrenceRules: [ReminderRecurrenceBackup]
+}
+
 private let operationTimeout: TimeInterval = 30
 
 private func checked(
@@ -159,26 +285,17 @@ private func fetchReminders(
     }
 }
 
-private func exactTemporaryCalendars(
-    eventStore: EKEventStore,
-    names: Set<String>
-) -> [EKCalendar] {
-    eventStore.calendars(for: .reminder).filter {
-        names.contains($0.title)
-    }
-}
-
 private func exactTemporaryCalendar(
     eventStore: EKEventStore,
-    name: String
+    identifier: String,
+    expectedName: String
 ) throws -> EKCalendar {
-    let matches = exactTemporaryCalendars(
-        eventStore: eventStore,
-        names: [name]
-    )
-    guard matches.count == 1, let calendar = matches.first else {
+    guard
+        let calendar = eventStore.calendar(withIdentifier: identifier),
+        calendar.title == expectedName
+    else {
         throw IntegrationFailure(
-            description: "temporary calendar lookup was not unique"
+            description: "temporary calendar lookup failed"
         )
     }
     return calendar
@@ -187,17 +304,9 @@ private func exactTemporaryCalendar(
 private func createTemporaryCalendars(
     eventStore: EKEventStore,
     targetName: String,
-    otherName: String
+    otherName: String,
+    identifiers: inout TemporaryCalendarIdentifiers
 ) throws {
-    let exactNames: Set<String> = [targetName, otherName]
-    guard exactTemporaryCalendars(
-        eventStore: eventStore,
-        names: exactNames
-    ).isEmpty else {
-        throw IntegrationFailure(
-            description: "temporary calendar UUID collision"
-        )
-    }
     let reminderSources = eventStore.sources.filter {
         $0.sourceType == .local || $0.sourceType == .calDAV
     }
@@ -210,47 +319,63 @@ private func createTemporaryCalendars(
     let target = EKCalendar(for: .reminder, eventStore: eventStore)
     target.title = targetName
     target.source = source
-    try eventStore.saveCalendar(target, commit: false)
+    try eventStore.saveCalendar(target, commit: true)
+    guard !target.calendarIdentifier.isEmpty else {
+        try? eventStore.removeCalendar(target, commit: true)
+        throw IntegrationFailure(
+            description: "target calendar identifier was unavailable"
+        )
+    }
+    let targetIdentifier = target.calendarIdentifier
+    identifiers.target = targetIdentifier
 
     let other = EKCalendar(for: .reminder, eventStore: eventStore)
     other.title = otherName
     other.source = source
-    try eventStore.saveCalendar(other, commit: false)
-
-    try eventStore.commit()
-    eventStore.reset()
-    guard exactTemporaryCalendars(
-        eventStore: eventStore,
-        names: exactNames
-    ).count == exactNames.count else {
+    try eventStore.saveCalendar(other, commit: true)
+    guard !other.calendarIdentifier.isEmpty else {
+        try? eventStore.removeCalendar(other, commit: true)
         throw IntegrationFailure(
-            description: "temporary calendars were not persisted"
+            description: "other calendar identifier was unavailable"
         )
     }
+    let otherIdentifier = other.calendarIdentifier
+    identifiers.other = otherIdentifier
+
+    eventStore.reset()
+    _ = try exactTemporaryCalendar(
+        eventStore: eventStore,
+        identifier: targetIdentifier,
+        expectedName: targetName
+    )
+    _ = try exactTemporaryCalendar(
+        eventStore: eventStore,
+        identifier: otherIdentifier,
+        expectedName: otherName
+    )
 }
 
 private func cleanupTemporaryCalendars(
     eventStore: EKEventStore,
-    names: Set<String>
+    identifiers: [String]
 ) -> IntegrationFailure? {
-    for _ in 0..<3 {
-        eventStore.reset()
-        let matches = exactTemporaryCalendars(
-            eventStore: eventStore,
-            names: names
-        )
-        if matches.isEmpty {
-            return nil
-        }
-        for calendar in matches {
+    for identifier in identifiers {
+        for _ in 0..<3 {
+            eventStore.reset()
+            guard
+                let calendar = eventStore.calendar(
+                    withIdentifier: identifier
+                )
+            else {
+                break
+            }
             try? eventStore.removeCalendar(calendar, commit: true)
         }
     }
     eventStore.reset()
-    guard exactTemporaryCalendars(
-        eventStore: eventStore,
-        names: names
-    ).isEmpty else {
+    guard identifiers.allSatisfy({
+        eventStore.calendar(withIdentifier: $0) == nil
+    }) else {
         return IntegrationFailure(
             description: "temporary calendar cleanup failed"
         )
@@ -369,20 +494,6 @@ private func onlyReminder(
     return reminder
 }
 
-private func sameDateComponents(
-    _ lhs: DateComponents?,
-    _ rhs: DateComponents?
-) -> Bool {
-    guard let lhs, let rhs else {
-        return lhs == nil && rhs == nil
-    }
-    return lhs.year == rhs.year
-        && lhs.month == rhs.month
-        && lhs.day == rhs.day
-        && lhs.hour == rhs.hour
-        && lhs.minute == rhs.minute
-}
-
 private func latestBackupURL(localRoot: URL) throws -> URL {
     let backupDirectory = localRoot.appendingPathComponent(
         "PruneBackups",
@@ -421,7 +532,6 @@ private func runIntegrationTests() async throws -> Int {
     let eventStore = EKEventStore()
     let targetName = "TaskForgeReminderSync Test \(UUID().uuidString)"
     let otherName = "TaskForgeReminderSync Other \(UUID().uuidString)"
-    let exactNames: Set<String> = [targetName, otherName]
     let testRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent(
             "TaskForgeReminderEventKitTests-\(UUID().uuidString)",
@@ -439,12 +549,13 @@ private func runIntegrationTests() async throws -> Int {
     var bodyError: Error?
     var cleanupError: Error?
     var passCount = 0
+    var calendarIdentifiers = TemporaryCalendarIdentifiers()
 
     do {
         defer {
             let calendarError = cleanupTemporaryCalendars(
                 eventStore: eventStore,
-                names: exactNames
+                identifiers: calendarIdentifiers.all
             )
             var directoryError: IntegrationFailure?
             if FileManager.default.fileExists(atPath: testRoot.path) {
@@ -466,8 +577,19 @@ private func runIntegrationTests() async throws -> Int {
             try createTemporaryCalendars(
                 eventStore: eventStore,
                 targetName: targetName,
-                otherName: otherName
+                otherName: otherName,
+                identifiers: &calendarIdentifiers
             )
+            guard
+                let targetCalendarIdentifier =
+                    calendarIdentifiers.target,
+                let otherCalendarIdentifier =
+                    calendarIdentifiers.other
+            else {
+                throw IntegrationFailure(
+                    description: "temporary calendar identifiers missing"
+                )
+            }
             print("TEMP  \(targetName)")
             print("TEMP  \(otherName)")
 
@@ -561,11 +683,13 @@ private func runIntegrationTests() async throws -> Int {
 
             let targetCalendar = try exactTemporaryCalendar(
                 eventStore: eventStore,
-                name: targetName
+                identifier: targetCalendarIdentifier,
+                expectedName: targetName
             )
             let otherCalendar = try exactTemporaryCalendar(
                 eventStore: eventStore,
-                name: otherName
+                identifier: otherCalendarIdentifier,
+                expectedName: otherName
             )
             try stageFixtures(
                 eventStore: eventStore,
@@ -582,7 +706,8 @@ private func runIntegrationTests() async throws -> Int {
                 calendars: [
                     try exactTemporaryCalendar(
                         eventStore: eventStore,
-                        name: targetName
+                        identifier: targetCalendarIdentifier,
+                        expectedName: targetName
                     )
                 ]
             )
@@ -591,7 +716,8 @@ private func runIntegrationTests() async throws -> Int {
                 calendars: [
                     try exactTemporaryCalendar(
                         eventStore: eventStore,
-                        name: otherName
+                        identifier: otherCalendarIdentifier,
+                        expectedName: otherName
                     )
                 ]
             )
@@ -606,10 +732,21 @@ private func runIntegrationTests() async throws -> Int {
                 "other-list fixture count was incorrect"
             )
 
-            let plainIdentifier = try onlyReminder(
+            let initialTargetIdentifiers = Set(
+                initialTarget.map(\.calendarItemIdentifier)
+            )
+            let initialOtherIdentifiers = Set(
+                initialOther.map(\.calendarItemIdentifier)
+            )
+            let plainReminder = try onlyReminder(
                 initialTarget,
                 title: labels.plain
-            ).calendarItemIdentifier
+            )
+            let plainIdentifier =
+                plainReminder.calendarItemIdentifier
+            let plainFieldBaseline = ReminderFieldBaseline(
+                plainReminder
+            )
             let priorityIdentifier = try onlyReminder(
                 initialTarget,
                 title: labels.priority
@@ -630,11 +767,6 @@ private func runIntegrationTests() async throws -> Int {
                 initialTarget,
                 title: labels.historical
             ).calendarItemIdentifier
-            let otherIdentifier = try onlyReminder(
-                initialOther,
-                title: labels.other
-            ).calendarItemIdentifier
-
             let pruner = ReminderPruner(
                 eventStore: eventStore,
                 configuration: ReminderPruneConfiguration(
@@ -668,16 +800,32 @@ private func runIntegrationTests() async throws -> Int {
                 calendars: [
                     try exactTemporaryCalendar(
                         eventStore: eventStore,
-                        name: targetName
+                        identifier: targetCalendarIdentifier,
+                        expectedName: targetName
+                    )
+                ]
+            )
+            let afterFirstOther = try await fetchReminders(
+                eventStore: eventStore,
+                calendars: [
+                    try exactTemporaryCalendar(
+                        eventStore: eventStore,
+                        identifier: otherCalendarIdentifier,
+                        expectedName: otherName
                     )
                 ]
             )
             try checked(
                 &passCount,
-                afterFirst.contains {
-                    $0.calendarItemIdentifier == plainIdentifier
-                },
-                "first scan removed the plain external fixture"
+                Set(afterFirst.map(\.calendarItemIdentifier))
+                    == initialTargetIdentifiers,
+                "first scan changed the target identifier set"
+            )
+            try checked(
+                &passCount,
+                Set(afterFirstOther.map(\.calendarItemIdentifier))
+                    == initialOtherIdentifiers,
+                "first scan changed the other-list identifier set"
             )
 
             let second = try await pruner.advance(
@@ -695,7 +843,8 @@ private func runIntegrationTests() async throws -> Int {
                 calendars: [
                     try exactTemporaryCalendar(
                         eventStore: eventStore,
-                        name: targetName
+                        identifier: targetCalendarIdentifier,
+                        expectedName: targetName
                     )
                 ]
             )
@@ -740,15 +889,15 @@ private func runIntegrationTests() async throws -> Int {
                 calendars: [
                     try exactTemporaryCalendar(
                         eventStore: eventStore,
-                        name: otherName
+                        identifier: otherCalendarIdentifier,
+                        expectedName: otherName
                     )
                 ]
             )
             try checked(
                 &passCount,
-                afterSecondOther.contains {
-                    $0.calendarItemIdentifier == otherIdentifier
-                },
+                Set(afterSecondOther.map(\.calendarItemIdentifier))
+                    == initialOtherIdentifiers,
                 "other-list fixture was touched"
             )
 
@@ -775,7 +924,8 @@ private func runIntegrationTests() async throws -> Int {
                 calendars: [
                     try exactTemporaryCalendar(
                         eventStore: eventStore,
-                        name: targetName
+                        identifier: targetCalendarIdentifier,
+                        expectedName: targetName
                     )
                 ]
             )
@@ -783,81 +933,18 @@ private func runIntegrationTests() async throws -> Int {
                 afterRestore,
                 title: restore.title
             )
+            let restoredIdentifier =
+                restored.calendarItemIdentifier
             try checked(
                 &passCount,
-                restored.title == restore.title,
-                "restored title did not match"
-            )
-            try checked(
-                &passCount,
-                restored.notes == restore.notes,
-                "restored notes did not match"
-            )
-            try checked(
-                &passCount,
-                restored.url == restore.url,
-                "restored URL did not match"
-            )
-            try checked(
-                &passCount,
-                restored.priority == 0,
-                "restored priority did not match"
-            )
-            try checked(
-                &passCount,
-                !restored.isCompleted,
-                "restored completion state did not match"
-            )
-            try checked(
-                &passCount,
-                sameDateComponents(
-                    restored.dueDateComponents,
-                    restore.dueDateComponents
-                ),
-                "restored due date did not match"
-            )
-            try checked(
-                &passCount,
-                sameDateComponents(
-                    restored.startDateComponents,
-                    restore.startDateComponents
-                ),
-                "restored start date did not match"
-            )
-            let restoredAlarms = restored.alarms ?? []
-            try checked(
-                &passCount,
-                restoredAlarms.count == 1,
-                "restored alarm count did not match"
-            )
-            try checked(
-                &passCount,
-                restoredAlarms.first?.absoluteDate == nil
-                    && abs(
-                        (restoredAlarms.first?.relativeOffset ?? 0)
-                            - restore.alarmOffset
-                    ) < 0.001,
-                "restored alarm fields did not match"
-            )
-            let restoredRules = restored.recurrenceRules ?? []
-            try checked(
-                &passCount,
-                restoredRules.count == 1,
-                "restored recurrence count did not match"
-            )
-            try checked(
-                &passCount,
-                restoredRules.first?.frequency == .daily
-                    && restoredRules.first?.interval
-                        == restore.recurrenceInterval
-                    && restoredRules.first?.recurrenceEnd?.occurrenceCount
-                        == restore.recurrenceCount,
-                "restored recurrence fields did not match"
+                ReminderFieldBaseline(restored)
+                    == plainFieldBaseline,
+                "restored fields differ from the saved EventKit baseline"
             )
 
             let withinGrace = try await pruner.advance(
                 snapshot: snapshot,
-                now: restoreNow.addingTimeInterval(61)
+                now: restoreNow.addingTimeInterval(86_399)
             )
             try checked(
                 &passCount,
@@ -886,20 +973,45 @@ private func runIntegrationTests() async throws -> Int {
                 "post-grace second scan did not delete the candidate"
             )
 
+            let finalTarget = try await fetchReminders(
+                eventStore: eventStore,
+                calendars: [
+                    try exactTemporaryCalendar(
+                        eventStore: eventStore,
+                        identifier: targetCalendarIdentifier,
+                        expectedName: targetName
+                    )
+                ]
+            )
             let finalOther = try await fetchReminders(
                 eventStore: eventStore,
                 calendars: [
                     try exactTemporaryCalendar(
                         eventStore: eventStore,
-                        name: otherName
+                        identifier: otherCalendarIdentifier,
+                        expectedName: otherName
                     )
                 ]
             )
             try checked(
                 &passCount,
-                finalOther.contains {
-                    $0.calendarItemIdentifier == otherIdentifier
-                },
+                !Set(finalTarget.map(\.calendarItemIdentifier))
+                    .contains(restoredIdentifier)
+                    && !finalTarget.contains {
+                        $0.title == labels.plain
+                    },
+                "post-grace second scan retained the restored fixture"
+            )
+            try checked(
+                &passCount,
+                Set(finalTarget.map(\.calendarItemIdentifier))
+                    == afterSecondIdentifiers,
+                "post-grace scans changed a protected fixture"
+            )
+            try checked(
+                &passCount,
+                Set(finalOther.map(\.calendarItemIdentifier))
+                    == initialOtherIdentifiers,
                 "other-list fixture was touched after restore"
             )
         } catch {
@@ -920,7 +1032,16 @@ do {
     let passCount = try await runIntegrationTests()
     print("PASS  \(passCount) isolated EventKit checks")
     print("EventKit integration tests passed")
+} catch let failure as IntegrationFailure {
+    fputs(
+        "FAIL  EventKit integration tests: \(failure.description)\n",
+        stderr
+    )
+    exit(1)
 } catch {
-    fputs("FAIL  EventKit integration tests: \(error)\n", stderr)
+    fputs(
+        "FAIL  EventKit integration tests: unexpected-stage-failure\n",
+        stderr
+    )
     exit(1)
 }
