@@ -18,6 +18,14 @@ private enum RunMode {
     case help
 }
 
+private enum CommandParsingError: Error, LocalizedError {
+    case conflictingRunModes
+
+    var errorDescription: String? {
+        "不能同时指定多个运行模式。"
+    }
+}
+
 private struct Options {
     var mode: RunMode = .dryRun
     var listName = "TaskForge 今日"
@@ -28,36 +36,37 @@ private struct Options {
 
     static func parse(_ arguments: [String], calendar: Calendar) throws -> Options {
         var options = Options()
+        var selectedMode: RunMode?
         var index = 0
         while index < arguments.count {
             let argument = arguments[index]
             switch argument {
             case "--check-config":
-                options.mode = .checkConfig
+                try select(.checkConfig, into: &selectedMode)
             case "--dry-run":
-                options.mode = .dryRun
+                try select(.dryRun, into: &selectedMode)
             case "--audit":
-                options.mode = .audit
+                try select(.audit, into: &selectedMode)
             case "--deduplicate-dry-run":
-                options.mode = .deduplicateDryRun
+                try select(.deduplicateDryRun, into: &selectedMode)
             case "--deduplicate":
-                options.mode = .deduplicate
+                try select(.deduplicate, into: &selectedMode)
             case "--sync":
-                options.mode = .sync
+                try select(.sync, into: &selectedMode)
             case "--reverse-dry-run":
-                options.mode = .reverseDryRun
+                try select(.reverseDryRun, into: &selectedMode)
             case "--reverse-once":
-                options.mode = .reverseOnce
+                try select(.reverseOnce, into: &selectedMode)
             case "--prune-dry-run":
-                options.mode = .pruneDryRun
+                try select(.pruneDryRun, into: &selectedMode)
             case "--prune-once":
-                options.mode = .pruneOnce
+                try select(.pruneOnce, into: &selectedMode)
             case "--restore-last-prune":
-                options.mode = .restoreLastPrune
+                try select(.restoreLastPrune, into: &selectedMode)
             case "--watch":
-                options.mode = .watch
+                try select(.watch, into: &selectedMode)
             case "--help", "-h":
-                options.mode = .help
+                try select(.help, into: &selectedMode)
             case "--list-name":
                 index += 1
                 options.listName = try value(after: argument, at: index, in: arguments)
@@ -89,7 +98,18 @@ private struct Options {
             }
             index += 1
         }
+        options.mode = selectedMode ?? .dryRun
         return options
+    }
+
+    private static func select(
+        _ mode: RunMode,
+        into selectedMode: inout RunMode?
+    ) throws {
+        guard selectedMode == nil else {
+            throw CommandParsingError.conflictingRunModes
+        }
+        selectedMode = mode
     }
 
     private static func value(
@@ -151,6 +171,17 @@ private struct TaskForgeReminderSyncCommand {
                 Array(CommandLine.arguments.dropFirst()),
                 calendar: calendar
             )
+
+            #if DEBUG
+            if
+                ProcessInfo.processInfo.environment[
+                    "TASKFORGE_REMINDER_SYNC_TEST_PARSE_ONLY"
+                ] == "1"
+            {
+                print("参数解析完成")
+                return
+            }
+            #endif
 
             switch options.mode {
             case .help:

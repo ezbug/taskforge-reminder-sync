@@ -2,6 +2,7 @@ import Dispatch
 import Darwin
 import Foundation
 import TaskForgeReminderCore
+@testable import TaskForgeReminderEventKit
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String
@@ -283,6 +284,21 @@ private func taskForgeEntries(at url: URL) throws -> [String] {
 }
 
 private let tests: [TestCase] = [
+    ("prune target calendar selection fails closed on ambiguity", {
+        let missing: Int? = try ReminderPruner.uniqueTargetCalendarMatch([])
+        try require(missing == nil, "zero matching calendars should be absent")
+        let unique = try ReminderPruner.uniqueTargetCalendarMatch([7])
+        try require(unique == 7, "one matching calendar should be selected")
+
+        do {
+            let _: Int? = try ReminderPruner.uniqueTargetCalendarMatch([7, 8])
+            throw TestFailure(
+                description: "multiple matching calendars must fail closed"
+            )
+        } catch ReminderPrunerError.ambiguousTargetCalendar {
+            // Expected anonymous fail-closed error.
+        }
+    }),
     ("TaskForge v6 MessagePack store decodes task records", {
         let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())
         try require(snapshot.version == 6, "unexpected task store version")

@@ -130,7 +130,7 @@ public final class ReminderPruner {
         let operationLock = try operationFileLock(exclusive: false)
         defer { operationLock.unlock() }
 
-        guard let targetCalendar = targetCalendar() else {
+        guard let targetCalendar = try targetCalendar() else {
             return ReminderPruneCounts()
         }
         let reminders = try await fetchReminders(in: targetCalendar)
@@ -170,7 +170,7 @@ public final class ReminderPruner {
         let operationLock = try operationFileLock(exclusive: true)
         defer { operationLock.unlock() }
 
-        guard let targetCalendar = targetCalendar() else {
+        guard let targetCalendar = try targetCalendar() else {
             return ReminderPruneCounts()
         }
         let initialReminders = try await fetchReminders(in: targetCalendar)
@@ -507,10 +507,24 @@ public final class ReminderPruner {
         }
     }
 
-    private func targetCalendar() -> EKCalendar? {
-        eventStore.calendars(for: .reminder).first {
+    nonisolated static func uniqueTargetCalendarMatch<Element>(
+        _ matches: [Element]
+    ) throws -> Element? {
+        switch matches.count {
+        case 0:
+            return nil
+        case 1:
+            return matches[0]
+        default:
+            throw ReminderPrunerError.ambiguousTargetCalendar
+        }
+    }
+
+    private func targetCalendar() throws -> EKCalendar? {
+        let matches = eventStore.calendars(for: .reminder).filter {
             $0.title == configuration.listName
         }
+        return try Self.uniqueTargetCalendarMatch(matches)
     }
 
     private func reconcileUnresolvedBackup(
