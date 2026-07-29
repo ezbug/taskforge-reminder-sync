@@ -854,6 +854,52 @@ private let tests: [TestCase] = [
             "readable TaskNotes source should be present"
         )
     }),
+    ("source presence fails closed for missing or unknown source metadata", {
+        let cases = [
+            TaskForgeTask(
+                identifier: "missing-line",
+                title: "保留任务",
+                status: "todo",
+                priority: nil,
+                scheduled: nil,
+                filePath: "/vault/note.md",
+                sourceType: "markdownInline",
+                originalLine: nil,
+                lineNumber: 1
+            ),
+            TaskForgeTask(
+                identifier: "missing-type",
+                title: "保留任务",
+                status: "todo",
+                priority: nil,
+                scheduled: nil,
+                filePath: "/vault/note.md",
+                sourceType: nil,
+                originalLine: "- [ ] 保留任务",
+                lineNumber: 1
+            ),
+            TaskForgeTask(
+                identifier: "unknown-type",
+                title: "保留任务",
+                status: "todo",
+                priority: nil,
+                scheduled: nil,
+                filePath: "/vault/note.md",
+                sourceType: "unsupported",
+                originalLine: "- [ ] 保留任务",
+                lineNumber: 1
+            )
+        ]
+        for task in cases {
+            try require(
+                TaskSourcePresenceInspector.inspect(
+                    task: task,
+                    contents: "- [ ] 保留任务\n"
+                ) == .indeterminate,
+                "\(task.identifier) must fail closed"
+            )
+        }
+    }),
     ("prune policy protects non-target, completed and important reminders", {
         let target = "calendar-target"
         let protected = [
