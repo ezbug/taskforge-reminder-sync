@@ -261,6 +261,8 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
         }
 
         let data = try readData(at: url, error: .invalidBackup)
+        let rawRoot: [String: Any]
+        let rawPayload: [String: Any]
         let hasSchemaVersion: Bool
         do {
             guard
@@ -270,6 +272,8 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             else {
                 throw ReminderPruneStoreError.checksumMismatch
             }
+            rawRoot = root
+            rawPayload = payload
             hasSchemaVersion = payload["backupSchemaVersion"] != nil
         } catch let error as ReminderPruneStoreError {
             throw error
@@ -296,6 +300,14 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
             }
             batch = envelope.payload
         } else {
+            guard
+                Set(rawRoot.keys) == LegacyBackupEnvelopeV1.envelopeKeys,
+                LegacyReminderPruneBackupBatchV1.hasExactKeys(
+                    Set(rawPayload.keys)
+                )
+            else {
+                throw ReminderPruneStoreError.checksumMismatch
+            }
             let legacy: LegacyBackupEnvelopeV1
             do {
                 legacy = try decoder.decode(
@@ -712,28 +724,23 @@ public final class ReminderPruneLocalStore: @unchecked Sendable {
 
 public final class ReminderPruneOperationFileLock: @unchecked Sendable {
     public static func defaultAnchorURL() throws -> URL {
-        let fileManager = FileManager.default
-        let home = URL(
-            fileURLWithPath: NSHomeDirectory(),
-            isDirectory: true
-        )
-        var candidates = [fileManager.temporaryDirectory]
-        if let caches = fileManager.urls(
-            for: .cachesDirectory,
-            in: .userDomainMask
-        ).first {
-            candidates.append(caches)
+        guard
+            let account = getpwuid(getuid()),
+            let homePath = String(
+                validatingUTF8: account.pointee.pw_dir
+            )
+        else {
+            throw ReminderPruneStoreError.permissions
         }
-        candidates.append(
+        let home = URL(fileURLWithPath: homePath, isDirectory: true)
+        let candidates = [
             home.appendingPathComponent(
                 "Library/Caches",
                 isDirectory: true
-            )
-        )
-        candidates.append(
-            home.appendingPathComponent("Library", isDirectory: true)
-        )
-        candidates.append(home)
+            ),
+            home.appendingPathComponent("Library", isDirectory: true),
+            home
+        ]
         for candidate in candidates {
             if let validated = validatedAnchor(candidate) {
                 return validated
@@ -766,7 +773,8 @@ public final class ReminderPruneOperationFileLock: @unchecked Sendable {
         guard
             fstat(opened, &status) == 0,
             status.st_uid == getuid(),
-            status.st_mode & S_IFMT == S_IFDIR
+            status.st_mode & S_IFMT == S_IFDIR,
+            status.st_mode & 0o077 == 0
         else {
             _ = close(opened)
             throw ReminderPruneStoreError.permissions
@@ -807,7 +815,8 @@ public final class ReminderPruneOperationFileLock: @unchecked Sendable {
         guard
             lstat(resolved.path, &status) == 0,
             status.st_uid == getuid(),
-            status.st_mode & S_IFMT == S_IFDIR
+            status.st_mode & S_IFMT == S_IFDIR,
+            status.st_mode & 0o077 == 0
         else {
             return nil
         }
@@ -823,6 +832,11 @@ private struct BackupEnvelope: Codable {
 private struct LegacyBackupEnvelopeV1: Codable {
     let checksum: String
     let payload: LegacyReminderPruneBackupBatchV1
+
+    static let envelopeKeys: Set<String> = [
+        "checksum",
+        "payload"
+    ]
 }
 
 private struct LegacyReminderPruneBackupBatchV1: Codable {
@@ -837,6 +851,11 @@ private struct LegacyReminderPruneBackupBatchV1: Codable {
     let restoreAttemptIdentifier: UUID?
     let restoredItemIdentifiers: [String: String]
     let restoredAt: Date?
+
+    static func hasExactKeys(_ keys: Set<String>) -> Bool {
+        requiredKeys.isSubset(of: keys)
+            && keys.isSubset(of: requiredKeys.union(optionalKeys))
+    }
 
     func migrated() -> ReminderPruneBackupBatch {
         ReminderPruneBackupBatch(
@@ -855,4 +874,21 @@ private struct LegacyReminderPruneBackupBatchV1: Codable {
             restoredAt: restoredAt
         )
     }
+
+    private static let requiredKeys: Set<String> = [
+        "identifier",
+        "createdAt",
+        "targetCalendarIdentifier",
+        "targetCalendarTitle",
+        "targetSourceIdentifier",
+        "rulesVersion",
+        "items",
+        "restoredItemIdentifiers"
+    ]
+
+    private static let optionalKeys: Set<String> = [
+        "actuallyDeletedIdentifiers",
+        "restoreAttemptIdentifier",
+        "restoredAt"
+    ]
 }

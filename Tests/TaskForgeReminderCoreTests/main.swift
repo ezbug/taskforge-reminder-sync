@@ -1,4 +1,5 @@
 import Dispatch
+import Darwin
 import Foundation
 import TaskForgeReminderCore
 
@@ -228,6 +229,58 @@ private let legacyPruneBackupEnvelopeFixture = Data(
     {"checksum":"386b6ec8c52714e00c16f65f69c8dbace2eff0f899613a43f6cbb467796235c1","payload":{"createdAt":-978307180,"identifier":"00000000-0000-0000-0000-0000000000A1","items":[],"restoredItemIdentifiers":{},"rulesVersion":0,"targetCalendarIdentifier":"legacy-calendar","targetCalendarTitle":"Legacy list","targetSourceIdentifier":"legacy-source"}}
     """.utf8
 )
+
+private let legacyPruneBackupUnknownPayloadFieldFixture = Data(
+    """
+    {"checksum":"386b6ec8c52714e00c16f65f69c8dbace2eff0f899613a43f6cbb467796235c1","payload":{"createdAt":-978307180,"identifier":"00000000-0000-0000-0000-0000000000A1","items":[],"restoredItemIdentifiers":{},"rulesVersion":0,"targetCalendarIdentifier":"legacy-calendar","targetCalendarTitle":"Legacy list","targetSourceIdentifier":"legacy-source","unknownPayloadField":"must-not-be-ignored"}}
+    """.utf8
+)
+
+private func currentAccountHomeURL() throws -> URL {
+    guard
+        let account = getpwuid(getuid()),
+        let homePath = String(
+            validatingUTF8: account.pointee.pw_dir
+        )
+    else {
+        throw TestFailure(description: "current account home is unavailable")
+    }
+    return URL(fileURLWithPath: homePath, isDirectory: true)
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+}
+
+private func expectedOperationLockAnchorURL() throws -> URL {
+    let home = try currentAccountHomeURL()
+    let candidates = [
+        home.appendingPathComponent("Library/Caches", isDirectory: true),
+        home.appendingPathComponent("Library", isDirectory: true),
+        home
+    ]
+    for candidate in candidates {
+        let resolved = candidate.standardizedFileURL
+            .resolvingSymlinksInPath()
+        var status = stat()
+        guard lstat(resolved.path, &status) == 0 else {
+            continue
+        }
+        if status.st_uid == getuid(),
+            status.st_mode & S_IFMT == S_IFDIR,
+            status.st_mode & 0o077 == 0
+        {
+            return resolved
+        }
+    }
+    throw TestFailure(
+        description: "no deterministic private account anchor is available"
+    )
+}
+
+private func taskForgeEntries(at url: URL) throws -> [String] {
+    try FileManager.default.contentsOfDirectory(atPath: url.path)
+        .filter { $0.localizedCaseInsensitiveContains("taskforge") }
+        .sorted()
+}
 
 private let tests: [TestCase] = [
     ("TaskForge v6 MessagePack store decodes task records", {
@@ -1282,6 +1335,33 @@ private let tests: [TestCase] = [
             )
         }
     }),
+    ("legacy prune backup rejects an unknown payload field", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ReminderPruneLocalStore(rootURL: root)
+        let url = try store.saveBackup(pruneBackupFixture())
+        try legacyPruneBackupUnknownPayloadFieldFixture.write(
+            to: url,
+            options: .atomic
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+
+        do {
+            _ = try store.loadBackup(at: url)
+            throw TestFailure(
+                description: "unknown legacy payload field was accepted"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .checksumMismatch,
+                "unexpected unknown legacy field error"
+            )
+        }
+    }),
     ("restore policy separates backup schema from candidate rules", {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1326,14 +1406,24 @@ private let tests: [TestCase] = [
     ("prune operation flock does not change the filesystem tree", {
         let defaultAnchor =
             try ReminderPruneOperationFileLock.defaultAnchorURL()
+        let expectedDefaultAnchor = try expectedOperationLockAnchorURL()
         try require(
-            defaultAnchor.path != "/tmp"
-                && defaultAnchor.path != "/private/tmp",
-            "operation lock must use a per-user anchor"
+            defaultAnchor == expectedDefaultAnchor,
+            "operation lock anchor must be deterministic from account home"
         )
-        let defaultBefore = try FileManager.default.contentsOfDirectory(
-            atPath: defaultAnchor.path
-        ).sorted()
+        var defaultBeforeStatus = stat()
+        try require(
+            lstat(defaultAnchor.path, &defaultBeforeStatus) == 0,
+            "default operation lock anchor is unavailable"
+        )
+        try require(
+            defaultBeforeStatus.st_uid == getuid()
+                && defaultBeforeStatus.st_mode & S_IFMT == S_IFDIR
+                && defaultBeforeStatus.st_mode & 0o077 == 0,
+            "default operation lock anchor must be a private owned directory"
+        )
+        let defaultTaskForgeEntriesBefore =
+            try taskForgeEntries(at: defaultAnchor)
         let defaultShared = try ReminderPruneOperationFileLock(
             exclusive: false
         )
@@ -1342,12 +1432,20 @@ private let tests: [TestCase] = [
             exclusive: true
         )
         defaultExclusive.unlock()
-        let defaultAfter = try FileManager.default.contentsOfDirectory(
-            atPath: defaultAnchor.path
-        ).sorted()
+        var defaultAfterStatus = stat()
         try require(
-            defaultBefore == defaultAfter,
-            "default per-user flock must not change its directory tree"
+            lstat(defaultAnchor.path, &defaultAfterStatus) == 0
+                && defaultAfterStatus.st_dev == defaultBeforeStatus.st_dev
+                && defaultAfterStatus.st_ino == defaultBeforeStatus.st_ino
+                && defaultAfterStatus.st_uid == defaultBeforeStatus.st_uid
+                && defaultAfterStatus.st_mode & 0o777
+                    == defaultBeforeStatus.st_mode & 0o777,
+            "default flock must retain its private anchor inode"
+        )
+        try require(
+            try taskForgeEntries(at: defaultAnchor)
+                == defaultTaskForgeEntriesBefore,
+            "default flock must not create a TaskForge path"
         )
         do {
             _ = try ReminderPruneOperationFileLock(
@@ -1392,6 +1490,35 @@ private let tests: [TestCase] = [
             atPath: anchor.path
         ).sorted()
         try require(before == after, "flock must not create a lock path")
+    }),
+    ("prune operation flock rejects a non-private owned anchor", {
+        let anchor = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: anchor) }
+        try FileManager.default.createDirectory(
+            at: anchor,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o750]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o750],
+            ofItemAtPath: anchor.path
+        )
+
+        do {
+            _ = try ReminderPruneOperationFileLock(
+                exclusive: false,
+                anchorURL: anchor
+            )
+            throw TestFailure(
+                description: "non-private operation anchor was accepted"
+            )
+        } catch let error as ReminderPruneStoreError {
+            try require(
+                error == .permissions,
+                "unexpected non-private anchor error"
+            )
+        }
     }),
     ("prune read-only ledger load never creates its root", {
         let root = FileManager.default.temporaryDirectory
