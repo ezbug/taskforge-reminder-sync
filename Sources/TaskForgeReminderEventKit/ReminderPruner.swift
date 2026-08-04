@@ -10,17 +10,20 @@ public struct ReminderPruneConfiguration: Sendable {
     public var localRoot: URL
     public var confirmationInterval: TimeInterval
     public var restoreGraceInterval: TimeInterval
+    public var managedIndex: TaskForgeSyncIndex?
 
     public init(
         listName: String,
         localRoot: URL,
         confirmationInterval: TimeInterval = 60,
-        restoreGraceInterval: TimeInterval = 86_400
+        restoreGraceInterval: TimeInterval = 86_400,
+        managedIndex: TaskForgeSyncIndex? = nil
     ) {
         self.listName = listName
         self.localRoot = localRoot
         self.confirmationInterval = confirmationInterval
         self.restoreGraceInterval = restoreGraceInterval
+        self.managedIndex = managedIndex
     }
 }
 
@@ -58,6 +61,8 @@ private final class ReminderPrunerOperationGate {
 }
 
 public struct ReminderPruneCounts: Equatable, Sendable {
+    public init() {}
+
     public var scanned = 0
     public var firstSeen = 0
     public var waiting = 0
@@ -869,9 +874,14 @@ public final class ReminderPruner {
         {
             return .currentSnapshot
         }
-        guard
-            let reference = TaskSourceReference.decode(from: notes),
-            let path = reference.task.filePath
+        let markerTaskIdentifier = TaskSyncMarker.extract(from: notes)
+            .flatMap(TaskSyncMarker.decode)?.taskIdentifier
+        let reference = TaskSourceReference.decode(from: notes)
+            ?? markerTaskIdentifier.flatMap {
+                configuration.managedIndex?.entries[$0]?.sourceReference
+                    .map(TaskSourceReference.init(task:))
+            }
+        guard let reference, let path = reference.task.filePath
         else {
             return .absent
         }

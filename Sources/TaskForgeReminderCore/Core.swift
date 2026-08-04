@@ -53,6 +53,38 @@ public struct TaskForgeTask: Codable, Equatable, Sendable {
     public let lineNumber: Int?
     public let onCompletion: String?
     public let recurrence: String?
+    public let tags: [String]
+    public let contexts: [String]
+    public let projects: [String]
+    public let due: TaskForgeScheduledDate?
+    public let start: TaskForgeScheduledDate?
+    public let completionDay: TaskForgeDay?
+    public let cancelledDay: TaskForgeDay?
+    public let isBlocked: Bool
+    public let fileName: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case identifier
+        case title
+        case status
+        case priority
+        case scheduled
+        case filePath
+        case sourceType
+        case originalLine
+        case lineNumber
+        case onCompletion
+        case recurrence
+        case tags
+        case contexts
+        case projects
+        case due
+        case start
+        case completionDay
+        case cancelledDay
+        case isBlocked
+        case fileName
+    }
 
     public init(
         identifier: String,
@@ -65,7 +97,16 @@ public struct TaskForgeTask: Codable, Equatable, Sendable {
         originalLine: String?,
         lineNumber: Int?,
         onCompletion: String? = nil,
-        recurrence: String? = nil
+        recurrence: String? = nil,
+        tags: [String] = [],
+        contexts: [String] = [],
+        projects: [String] = [],
+        due: TaskForgeScheduledDate? = nil,
+        start: TaskForgeScheduledDate? = nil,
+        completionDay: TaskForgeDay? = nil,
+        cancelledDay: TaskForgeDay? = nil,
+        isBlocked: Bool = false,
+        fileName: String? = nil
     ) {
         self.identifier = identifier
         self.title = title
@@ -78,10 +119,69 @@ public struct TaskForgeTask: Codable, Equatable, Sendable {
         self.lineNumber = lineNumber
         self.onCompletion = onCompletion
         self.recurrence = recurrence
+        self.tags = tags
+        self.contexts = contexts
+        self.projects = projects
+        self.due = due
+        self.start = start
+        self.completionDay = completionDay
+        self.cancelledDay = cancelledDay
+        self.isBlocked = isBlocked
+        self.fileName = fileName
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            identifier: try container.decode(String.self, forKey: .identifier),
+            title: try container.decode(String.self, forKey: .title),
+            status: try container.decode(String.self, forKey: .status),
+            priority: try container.decodeIfPresent(String.self, forKey: .priority),
+            scheduled: try container.decodeIfPresent(
+                TaskForgeScheduledDate.self,
+                forKey: .scheduled
+            ),
+            filePath: try container.decodeIfPresent(String.self, forKey: .filePath),
+            sourceType: try container.decodeIfPresent(String.self, forKey: .sourceType),
+            originalLine: try container.decodeIfPresent(
+                String.self,
+                forKey: .originalLine
+            ),
+            lineNumber: try container.decodeIfPresent(Int.self, forKey: .lineNumber),
+            onCompletion: try container.decodeIfPresent(
+                String.self,
+                forKey: .onCompletion
+            ),
+            recurrence: try container.decodeIfPresent(String.self, forKey: .recurrence),
+            tags: try container.decodeIfPresent([String].self, forKey: .tags) ?? [],
+            contexts: try container.decodeIfPresent([String].self, forKey: .contexts) ?? [],
+            projects: try container.decodeIfPresent([String].self, forKey: .projects) ?? [],
+            due: try container.decodeIfPresent(
+                TaskForgeScheduledDate.self,
+                forKey: .due
+            ),
+            start: try container.decodeIfPresent(
+                TaskForgeScheduledDate.self,
+                forKey: .start
+            ),
+            completionDay: try container.decodeIfPresent(
+                TaskForgeDay.self,
+                forKey: .completionDay
+            ),
+            cancelledDay: try container.decodeIfPresent(
+                TaskForgeDay.self,
+                forKey: .cancelledDay
+            ),
+            isBlocked: try container.decodeIfPresent(Bool.self, forKey: .isBlocked)
+                ?? false,
+            fileName: try container.decodeIfPresent(String.self, forKey: .fileName)
+        )
     }
 
     public var isCompleted: Bool {
-        status == "done" || status == "cancelled"
+        let canonical = TaskForgeKanbanStatus.canonical(status)
+        return canonical == TaskForgeKanbanStatus.done.rawValue
+            || canonical == TaskForgeKanbanStatus.cancelled.rawValue
     }
 }
 
@@ -147,7 +247,34 @@ public enum TaskForgeTaskStore {
             throw TaskForgeTaskStoreError.unsupportedVersion(version)
         }
 
-        let tasks = records.compactMap(decodeTaskRecord)
+        var allRecords = records
+        while decoder.hasRemaining {
+            let trailing = try decoder.decodeValue()
+            guard trailing.arrayValue?.count == 33 else {
+                throw TaskForgeTaskStoreError.malformed(
+                    "任务库尾部包含未知记录"
+                )
+            }
+            allRecords.append(trailing)
+        }
+
+        var tasks: [TaskForgeTask] = []
+        tasks.reserveCapacity(allRecords.count)
+        for record in allRecords {
+            // TaskForge leaves a scalar `1` tombstone in this array after an
+            // indexed record is removed. It is not a task and is present in
+            // the live v6 store, so it must not make an otherwise valid store
+            // fail closed or become a synthetic task.
+            if record.intValue == 1 {
+                continue
+            }
+            guard let task = decodeTaskRecord(record) else {
+                throw TaskForgeTaskStoreError.malformed(
+                    "任务记录不完整或字段类型无效"
+                )
+            }
+            tasks.append(task)
+        }
         return TaskForgeSnapshot(version: version, vaultPath: vaultPath, tasks: tasks)
     }
 
@@ -175,8 +302,37 @@ public enum TaskForgeTaskStore {
             originalLine: fields[31].stringValue,
             lineNumber: fields[32].intValue,
             onCompletion: fields[25].stringValue,
-            recurrence: fields[30].stringValue
+            recurrence: fields[30].stringValue,
+            tags: decodeStrings(fields[5]),
+            contexts: decodeStrings(fields[6]),
+            projects: decodeStrings(fields[7]),
+            due: decodeScheduledDate(fields[14]),
+            start: decodeScheduledDate(fields[13]),
+            completionDay: decodeDay(fields[15]),
+            cancelledDay: decodeDay(fields[16]),
+            isBlocked: fields[26].boolValue ?? false,
+            fileName: fields[18].stringValue.map {
+                URL(fileURLWithPath: $0).lastPathComponent
+            }
         )
+    }
+
+    private static func decodeStrings(_ value: MessagePackValue) -> [String] {
+        value.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    private static func decodeDay(_ value: MessagePackValue) -> TaskForgeDay? {
+        guard
+            let fields = value.arrayValue,
+            let date = fields.first?.arrayValue,
+            date.count >= 3,
+            let year = date[0].intValue,
+            let month = date[1].intValue,
+            let day = date[2].intValue
+        else {
+            return nil
+        }
+        return TaskForgeDay(year: year, month: month, day: day)
     }
 
     private static func decodeScheduledDate(
@@ -1007,6 +1163,13 @@ private indirect enum MessagePackValue {
         return value
     }
 
+    var boolValue: Bool? {
+        guard case let .bool(value) = self else {
+            return nil
+        }
+        return value
+    }
+
     var arrayValue: [MessagePackValue]? {
         guard case let .array(value) = self else {
             return nil
@@ -1018,6 +1181,10 @@ private indirect enum MessagePackValue {
 private struct MessagePackDecoder {
     private let data: Data
     private var offset = 0
+
+    var hasRemaining: Bool {
+        offset < data.count
+    }
 
     init(data: Data) {
         self.data = data

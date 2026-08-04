@@ -128,8 +128,32 @@ private let singleModes: [([String], String)] = [
     (["--prune-once"], "prune-once"),
     (["--restore-last-prune"], "restore-last-prune"),
     (["--watch"], "watch"),
-    (["--help"], "help")
+    (["--help"], "help"),
+    (["--source", "custom-list"], "dry-run"),
+    (["--source", "scheduled-day", "--date", "2026-08-04"], "dry-run")
 ]
+
+private func requireSourceCompatibilityRules() throws {
+    let result = try runParser([
+        "--source", "custom-list", "--date", "2026-08-04"
+    ])
+    try require(
+        result.status == 1
+            && result.error.contains("scheduled-day"),
+        "custom-list must reject legacy date selection"
+    )
+    try require(
+        !result.error.contains("2026-08-04"),
+        "parser error must not echo a date value"
+    )
+    let unknown = try runParser(["--source", "not-a-source"])
+    try require(
+        unknown.status == 1
+            && unknown.error.contains("custom-list")
+            && unknown.error.contains("scheduled-day"),
+        "unknown source must fail closed"
+    )
+}
 
 do {
     for (index, pair) in conflictPairs.enumerated() {
@@ -146,6 +170,7 @@ do {
             label: arguments.first ?? "no mode"
         )
     }
+    try requireSourceCompatibilityRules()
     let testCount = conflictPairs.count * 2 + singleModes.count
     print("\(testCount)/\(testCount) CLI parser tests passed")
 } catch {

@@ -26,6 +26,9 @@ enum SyncError: Error, LocalizedError {
     case backupFailed(String)
     case writeVerificationFailed(String)
     case taskForgeVerificationTimedOut(String)
+    case reminderFetchFailed
+    case invalidSource(String)
+    case legacyOptionRequiresScheduledDay(String)
 
     var errorDescription: String? {
         switch self {
@@ -53,6 +56,12 @@ enum SyncError: Error, LocalizedError {
             return "写入后内容校验失败：\(path)"
         case let .taskForgeVerificationTimedOut(title):
             return "源文件已写入，但等待 TaskForge 确认完成超时：\(title)"
+        case .reminderFetchFailed:
+            return "提醒事项读取超时或失败，已按失败关闭。"
+        case let .invalidSource(value):
+            return "同步源必须是 custom-list 或 scheduled-day：\(value)"
+        case let .legacyOptionRequiresScheduledDay(value):
+            return "参数 \(value) 仅能在 --source scheduled-day 兼容模式使用。"
         }
     }
 }

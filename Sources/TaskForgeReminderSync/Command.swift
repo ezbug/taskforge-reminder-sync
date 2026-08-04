@@ -49,6 +49,11 @@ private enum RunMode {
     }
 }
 
+private enum SyncSource: String {
+    case customList = "custom-list"
+    case scheduledDay = "scheduled-day"
+}
+
 private enum CommandParsingError: Error, LocalizedError {
     case conflictingRunModes
 
@@ -59,7 +64,10 @@ private enum CommandParsingError: Error, LocalizedError {
 
 private struct Options {
     var mode: RunMode = .dryRun
+    var source: SyncSource = .customList
     var listName = "TaskForge 今日"
+    var taskForgeListID: String?
+    var listPrefix: String?
     var taskStorePath = TaskForgeTaskStore.defaultPath
     var requestedDay: TaskForgeDay?
     var taskIdentifier: String?
@@ -98,6 +106,27 @@ private struct Options {
                 try select(.watch, into: &selectedMode)
             case "--help", "-h":
                 try select(.help, into: &selectedMode)
+            case "--source":
+                index += 1
+                let value = try value(after: argument, at: index, in: arguments)
+                guard let source = SyncSource(rawValue: value) else {
+                    throw SyncError.invalidSource(value)
+                }
+                options.source = source
+            case "--taskforge-list-id":
+                index += 1
+                options.taskForgeListID = try value(
+                    after: argument,
+                    at: index,
+                    in: arguments
+                )
+            case "--list-prefix":
+                index += 1
+                options.listPrefix = try value(
+                    after: argument,
+                    at: index,
+                    in: arguments
+                )
             case "--list-name":
                 index += 1
                 options.listName = try value(after: argument, at: index, in: arguments)
@@ -128,6 +157,14 @@ private struct Options {
                 throw SyncError.unknownArgument(argument)
             }
             index += 1
+        }
+        if options.source == .customList,
+            options.requestedDay != nil
+                || options.listName != "TaskForge 今日"
+        {
+            throw SyncError.legacyOptionRequiresScheduledDay(
+                "--date/--list-name"
+            )
         }
         options.mode = selectedMode ?? .dryRun
         return options
@@ -232,7 +269,33 @@ private struct TaskForgeReminderSyncCommand {
         }
     }
 
+    @MainActor
     private static func checkConfig(options: Options, calendar: Calendar) throws {
+        if options.source == .customList {
+            let engine = KanbanSyncEngine(
+                configuration: kanbanConfiguration(options: options),
+                calendar: calendar
+            )
+            let preview = try engine.preview()
+            print(
+                "TaskForge："
+                    + (FileManager.default.fileExists(
+                        atPath: "/Applications/TaskForge.app"
+                    ) ? "已安装" : "未在 /Applications 找到")
+            )
+            print("任务库：\(options.taskStorePath)")
+            print("自定义列表：\(preview.listName)")
+            print("列表成员：\(preview.totalMembers)")
+            printStatusCounts(preview.statusCounts)
+            print(
+                "配置 ID："
+                    + (preview.taskForgeListIDWasConfigured
+                        ? "已配置到私有状态"
+                        : "仅使用本次参数")
+            )
+            print("配置检查不会请求提醒事项权限，也不会写入任何内容。")
+            return
+        }
         let snapshot = try loadSnapshotWithRetry(at: options.taskStorePath)
         let requestedDay = options.requestedDay
             ?? TaskForgeDay(containing: Date(), calendar: calendar)
@@ -254,6 +317,10 @@ private struct TaskForgeReminderSyncCommand {
 
     @MainActor
     private static func run(options: Options, calendar: Calendar) async throws {
+        if options.source == .customList {
+            try await runCustomList(options: options, calendar: calendar)
+            return
+        }
         let configuration = SyncConfiguration(
             listName: options.listName,
             taskStorePath: options.taskStorePath,
@@ -349,7 +416,86 @@ private struct TaskForgeReminderSyncCommand {
         }
     }
 
+    @MainActor
+    private static func runCustomList(
+        options: Options,
+        calendar: Calendar
+    ) async throws {
+        let engine = KanbanSyncEngine(
+            configuration: kanbanConfiguration(options: options),
+            calendar: calendar
+        )
+        switch options.mode {
+        case .audit:
+            let preview = try engine.preview()
+            print("自定义列表成员：\(preview.totalMembers)")
+            printStatusCounts(preview.statusCounts)
+        case .sync:
+            let counts = try await engine.sync()
+            print(
+                "Kanban 双向同步：新建 \(counts.created)，更新 \(counts.updated)，"
+                    + "移动 \(counts.moved)，完成 \(counts.completed)，"
+                    + "反向候选 \(counts.reverseCandidates)，"
+                    + "反向写入 \(counts.reverseWritten)，"
+                    + "拒绝 \(counts.reverseSkipped)，冲突 \(counts.conflicts)。"
+            )
+        case .reverseDryRun:
+            let counts = try await engine.reverse(dryRun: true)
+            print(
+                "Kanban 反向预演：候选 \(counts.reverseCandidates)，"
+                    + "没有写入源文件或私有状态。"
+            )
+        case .reverseOnce:
+            let counts = try await engine.reverse(dryRun: false)
+            print(
+                "Kanban 反向同步：候选 \(counts.reverseCandidates)，"
+                    + "写入 \(counts.reverseWritten)，拒绝 \(counts.reverseSkipped)。"
+            )
+        case .pruneDryRun, .pruneOnce:
+            let dryRun = options.mode == .pruneDryRun
+            let counts = try await engine.prune(dryRun: dryRun)
+            print(
+                dryRun
+                    ? "清理预演：扫描 \(counts.scanned)，首次 \(counts.firstSeen)，"
+                        + "等待 \(counts.waiting)，可删除 \(counts.ready)。"
+                    : "清理推进：扫描 \(counts.scanned)，首次 \(counts.firstSeen)，"
+                        + "等待 \(counts.waiting)，删除 \(counts.deleted)，"
+                        + "失败 \(counts.failed)。"
+            )
+        case .watch:
+            try await engine.watch()
+        case .deduplicateDryRun, .deduplicate:
+            let counts = try await engine.deduplicate(
+                dryRun: options.mode == .deduplicateDryRun
+            )
+            print(
+                "Kanban 去重\(options.mode == .deduplicateDryRun ? "预演" : "完成")："
+                    + "重复组 \(counts.duplicateGroups)，保留 \(counts.preserved)，"
+                    + "归档并完成 \(counts.archived)。"
+            )
+        case .restoreLastPrune:
+            throw SyncError.legacyOptionRequiresScheduledDay("--restore-last-prune")
+        case .checkConfig, .dryRun, .help:
+            break
+        }
+    }
+
+    @MainActor
     private static func printPreview(options: Options, calendar: Calendar) throws {
+        if options.source == .customList {
+            let engine = KanbanSyncEngine(
+                configuration: kanbanConfiguration(options: options),
+                calendar: calendar
+            )
+            let preview = try engine.preview()
+            print("自定义列表：\(preview.listName)")
+            print("列表成员：\(preview.totalMembers)")
+            printStatusCounts(preview.statusCounts)
+            print("计划操作：按状态同步到对应彩色列表；done/cancelled 只完成提醒，不删除 TaskForge 源任务。")
+            print("计划操作：Apple 事件防抖、1 秒轮询和 60 秒全量校准；不读取提醒事项。")
+            print("\n匿名只读预演：没有读取提醒事项，也没有写入任何内容。")
+            return
+        }
         let snapshot = try loadSnapshotWithRetry(at: options.taskStorePath)
         let requestedDay = options.requestedDay
             ?? TaskForgeDay(containing: Date(), calendar: calendar)
@@ -413,9 +559,12 @@ private struct TaskForgeReminderSyncCommand {
               TaskForgeReminderSync --watch
 
             选项：
-              --list-name NAME      目标提醒事项列表（默认：TaskForge 今日）
+              --source MODE         custom-list（默认）或 scheduled-day 兼容模式
+              --taskforge-list-id ID 固定绑定的 TaskForge Kanban 列表 ID（写入私有配置）
+              --list-prefix NAME    Apple 状态列表前缀（默认：TaskForge）
+              --list-name NAME      兼容模式目标提醒事项列表（默认：TaskForge 今日）
               --task-store PATH     TaskForge tasks.v6.bin 路径
-              --date DATE           指定要同步的本地日期
+              --date DATE           scheduled-day 兼容模式日期
               --task-id ID          只处理一个 TaskForge 任务
               --backup-root PATH    反向写入前的备份目录
               --dry-run             只列出今日任务，不请求权限（默认）
@@ -447,5 +596,29 @@ private struct TaskForgeReminderSyncCommand {
         print("历史源位置复用组：\(report.historicalSourceReuseGroups)")
         print("缺少可审计源身份：\(report.missingSourceIdentityCount)")
         print("去重状态：\(report.isDuplicateFree ? "通过" : "发现冲突")")
+    }
+
+    private static func kanbanConfiguration(
+        options: Options
+    ) -> KanbanSyncConfiguration {
+        KanbanSyncConfiguration(
+            taskStorePath: options.taskStorePath,
+            taskForgeListID: options.taskForgeListID,
+            listPrefix: options.listPrefix,
+            taskIdentifier: options.taskIdentifier,
+            backupRoot: options.backupRoot
+        )
+    }
+
+    private static func printStatusCounts(_ counts: [String: Int]) {
+        for status in TaskForgeKanbanStatus.allCases {
+            if let count = counts[status.rawValue] {
+                print("- \(status.rawValue)：\(count)")
+            }
+        }
+        let known = Set(TaskForgeKanbanStatus.allCases.map(\.rawValue))
+        for key in counts.keys.sorted() where !known.contains(key) {
+            print("- \(key)：\(counts[key] ?? 0)")
+        }
     }
 }

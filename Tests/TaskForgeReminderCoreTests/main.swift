@@ -384,8 +384,11 @@ private func taskRecord(
     return .array(fields)
 }
 
-private func taskStoreFixture() -> Data {
-    encodeFixture(
+private func taskStoreFixture(
+    extraRecord: FixtureValue? = nil,
+    trailingRecord: FixtureValue? = nil
+) -> Data {
+    let root = encodeFixture(
         .array([
             .int(6),
             .map([]),
@@ -415,10 +418,14 @@ private func taskStoreFixture() -> Data {
                     title: "明天任务",
                     status: "todo",
                     scheduled: taskDate(2026, 7, 27)
-                )
-            ])
+                ),
+                // A live v6 store can retain scalar `1` tombstones.
+                .int(1)
+            ] + (extraRecord.map { [$0] } ?? []))
         ])
     )
+    guard let trailingRecord else { return root }
+    return root + encodeFixture(trailingRecord)
 }
 
 private func pruneBackupFixture(
@@ -522,7 +529,212 @@ private func taskForgeEntries(at url: URL) throws -> [String] {
         .sorted()
 }
 
+private func kanbanTask(
+    identifier: String,
+    status: String,
+    line: String,
+    fileName: String = "Today.md",
+    tags: [String] = []
+) -> TaskForgeTask {
+    TaskForgeTask(
+        identifier: identifier,
+        title: identifier,
+        status: status,
+        priority: "medium",
+        scheduled: nil,
+        filePath: "/vault/\(fileName)",
+        sourceType: "markdownInline",
+        originalLine: line,
+        lineNumber: 1,
+        tags: tags,
+        fileName: fileName
+    )
+}
+
 private let tests: [TestCase] = [
+    ("custom Kanban filters preserve group and condition logic", {
+        let statusCondition = try TaskForgeFilterCondition(
+            type: "status",
+            operator: "not_equals",
+            value: "TaskStatus.done"
+        )
+        let fileCondition = try TaskForgeFilterCondition(
+            type: "file_name",
+            operator: "contains",
+            value: "Today"
+        )
+        let tagCondition = try TaskForgeFilterCondition(
+            type: "tag",
+            operator: "contains",
+            value: "keep"
+        )
+        let list = try TaskForgeCustomList(
+            id: "list",
+            name: "Today",
+            filterGroups: [
+                try TaskForgeFilterGroup(
+                    conditions: [statusCondition, fileCondition],
+                    matchMode: "all"
+                ),
+                try TaskForgeFilterGroup(
+                    conditions: [tagCondition],
+                    matchMode: "all"
+                )
+            ],
+            filterGroupsMatchMode: "any",
+            kanbanMode: true
+        )
+        let tasks = [
+            kanbanTask(
+                identifier: "first",
+                status: "todo",
+                line: "- [ ] first"
+            ),
+            kanbanTask(
+                identifier: "second",
+                status: "done",
+                line: "- [x] second"
+            ),
+            kanbanTask(
+                identifier: "third",
+                status: "todo",
+                line: "- [ ] third",
+                fileName: "Other.md",
+                tags: ["keep"]
+            )
+        ]
+        let selected = try TaskForgeFilterEvaluator.select(
+            tasks: tasks,
+            list: list,
+            calendar: Calendar(identifier: .gregorian)
+        )
+        try require(
+            selected.map(\.identifier) == ["first", "third"],
+            "custom list group logic selected the wrong tasks"
+        )
+    }),
+    ("custom Kanban rejects unknown fields and operators", {
+        let unknownField = Data(
+            """
+            {"id":"list","name":"Today","filterGroups":[{"conditions":[{"type":"unknown","operator":"equals"}],"matchMode":"all"}],"filterGroupsMatchMode":"all","kanbanMode":true}
+            """.utf8
+        )
+        do {
+            _ = try TaskForgeListConfigurationStore.decode(jsonData: unknownField)
+            throw TestFailure(description: "unknown field was accepted")
+        } catch let error as TaskForgeFilterConfigurationError {
+            try require(
+                error == .unsupportedField("unknown"),
+                "unexpected unknown field error"
+            )
+        }
+
+        let unknownOperator = Data(
+            """
+            {"id":"list","name":"Today","filterGroups":[{"conditions":[{"type":"status","operator":"guess"}],"matchMode":"all"}],"filterGroupsMatchMode":"all","kanbanMode":true}
+            """.utf8
+        )
+        do {
+            _ = try TaskForgeListConfigurationStore.decode(jsonData: unknownOperator)
+            throw TestFailure(description: "unknown operator was accepted")
+        } catch let error as TaskForgeFilterConfigurationError {
+            try require(
+                error == .unsupportedOperator("guess"),
+                "unexpected unknown operator error"
+            )
+        }
+    }),
+    ("TaskForge status symbol learning rejects conflicts", {
+        let tasks = [
+            kanbanTask(
+                identifier: "one",
+                status: "todo",
+                line: "- [ ] one"
+            ),
+            kanbanTask(
+                identifier: "two",
+                status: "todo",
+                line: "- [>] two"
+            )
+        ]
+        do {
+            _ = try TaskForgeStatusSymbolLearner.learn(tasks: tasks)
+            throw TestFailure(description: "conflicting symbols were learned")
+        } catch let error as TaskForgeStatusSymbolError {
+            try require(
+                error == .conflict("todo"),
+                "unexpected symbol conflict error"
+            )
+        }
+    }),
+    ("TaskForge status editor changes only the checkbox symbol", {
+        let task = kanbanTask(
+            identifier: "one",
+            status: "todo",
+            line: "- [ ] one"
+        )
+        let edit = try TaskForgeStatusSourceEditor.update(
+            task: task,
+            contents: "- [ ] one\n",
+            targetStatus: "inProgress",
+            symbols: ["inProgress": "[/]"]
+        )
+        try require(
+            edit.updatedContents == "- [/ ] one\n"
+                || edit.updatedContents == "- [/] one\n",
+            "status editor changed the source unexpectedly"
+        )
+        try require(
+            !edit.updatedContents.contains("✅"),
+            "status editor added an artificial completion date"
+        )
+    }),
+    ("TaskForge status aliases cover every Kanban state", {
+        let aliases = [
+            "todo", "scheduled", "ready", "inProgress", "on-hold",
+            "deferred", "blocked", "someday", "done", "cancelled"
+        ]
+        let expected = Set(TaskForgeKanbanStatus.allCases.map(\.rawValue))
+        try require(
+            Set(aliases.map(TaskForgeKanbanStatus.canonical)) == expected,
+            "status aliases do not cover the locked status matrix"
+        )
+    }),
+    ("Kanban private state is read-only until an explicit save", {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = TaskForgeSyncPrivateStore(rootURL: root)
+        try require(
+            try store.loadConfigurationReadOnly() == nil,
+            "read-only private load should not create a root"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: root.path),
+            "read-only private load created a root"
+        )
+        try store.saveConfiguration(
+            TaskForgeSyncPrivateConfiguration(taskForgeListID: "list")
+        )
+        try store.saveIndex(TaskForgeSyncIndex(listID: "list"))
+        let rootMode = try requireValue(
+            FileManager.default.attributesOfItem(atPath: root.path)[.posixPermissions]
+                as? NSNumber,
+            "private root mode missing"
+        )
+        let configMode = try requireValue(
+            FileManager.default.attributesOfItem(
+                atPath: store.configurationURL.path
+            )[.posixPermissions] as? NSNumber,
+            "private config mode missing"
+        )
+        try require(rootMode.intValue & 0o777 == 0o700, "private root is not 0700")
+        try require(configMode.intValue & 0o777 == 0o600, "private config is not 0600")
+        try require(
+            try store.loadConfigurationReadOnly()?.taskForgeListID == "list",
+            "private config did not round-trip"
+        )
+    }),
     ("reminder fetch timeout cancels a registered request exactly once", {
         let cancellations = LockedValues<Int>()
         do {
@@ -845,6 +1057,31 @@ private let tests: [TestCase] = [
         try require(snapshot.tasks.count == 4, "unexpected decoded task count")
         try require(snapshot.tasks[0].title == "示例任务", "unexpected first task title")
         try require(snapshot.tasks[0].sourceType == "markdownInline", "unexpected source type")
+    }),
+    ("TaskForge v6 store rejects unknown scalar records", {
+        do {
+            _ = try TaskForgeTaskStore.decode(
+                taskStoreFixture(extraRecord: .int(2))
+            )
+            throw TestFailure(description: "unknown scalar record was accepted")
+        } catch TaskForgeTaskStoreError.malformed {
+            // Expected fail-closed behavior.
+        }
+    }),
+    ("TaskForge v6 store includes a complete trailing task record", {
+        let trailing = taskRecord(
+            id: "trailing-task",
+            title: "追加任务",
+            status: "todo",
+            scheduled: .null
+        )
+        let snapshot = try TaskForgeTaskStore.decode(
+            taskStoreFixture(trailingRecord: trailing)
+        )
+        try require(
+            snapshot.tasks.contains { $0.identifier == "trailing-task" },
+            "complete trailing task record was dropped"
+        )
     }),
     ("today selection matches TaskForge calendar open tasks", {
         let snapshot = try TaskForgeTaskStore.decode(taskStoreFixture())

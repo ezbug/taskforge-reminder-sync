@@ -5,95 +5,55 @@ TaskForge Reminder Sync is designed to run entirely on the local Mac.
 ## Data it reads
 
 - TaskForge's local `tasks.v6.bin` cache;
-- titles, schedules, status and source metadata for TaskForge tasks;
-- reminders in the configured Apple Reminders list only; pruning does not fetch
-  reminder contents from any other list;
-- the matching Markdown or TaskNotes source file when reverse-completing a
-  linked reminder;
-- for pruning classification of an unfinished reminder, only the Vault file
-  named by that reminder's durable source reference, to confirm whether the
-  source task still exists.
+- the preferences plist entry `flutter.ctl_<fixed-list-id>`;
+- titles, status, priority, original schedule and source metadata needed for selected custom-list members;
+- reminders only when they carry this tool's marker or match the private index;
+- the exact Markdown or TaskNotes source file when an approved reverse write is requested;
+- the Vault source referenced by the private index when pruning confirms historical presence.
 
 ## Data it writes
 
-- linked reminders in the configured Apple Reminders list;
-- completion state in the matching Vault source task during reverse completion;
-- automatic deletion of target-list reminders only after they satisfy every
-  prune-candidate rule and pass the two-scan confirmation;
-- restored reminders rebuilt under the original reminders source and list
-  semantics recorded by the verified backup;
-- timestamped source-file backups under
-  `~/Library/Application Support/TaskForgeReminderSync/Backups/`;
-- the `0600` pruning candidate ledger at
-  `~/Library/Application Support/TaskForgeReminderSync/PruneCandidates.json`;
-- checksummed `0600` reminder restore backups under
-  `~/Library/Application Support/TaskForgeReminderSync/PruneBackups/`;
-- a `0600` local random hashing salt at
-  `~/Library/Application Support/TaskForgeReminderSync/PruneHashSalt`;
-- operational logs under `~/Library/Logs/`.
+- only the tool-managed Apple status lists and their managed reminders;
+- the status of a matching Vault source task during reverse sync;
+- verified source-file backups and verified reminder deletion backups;
+- private configuration, learned symbols, source references, state history and hashes;
+- aggregate operational logs.
 
-The pruning ledger stores raw EventKit and target-list identifiers, timestamps,
-candidate fingerprints, rules versions and restore grace periods. Pruning
-backups contain the reminder fields needed for restoration, including titles,
-notes, dates, priority, alarms, recurrence data and original system
-identifiers. These are sensitive local runtime data. Their parent application
-support directory, source-backup tree and batch directories are restricted to
-the current user (`0700`); backup and state files use `0600`.
+The default private root is:
+
+```text
+~/Library/Application Support/TaskForgeReminderSync/
+```
+
+The root and directories are `0700`; configuration, index, ledger, source backups, reminder
+backups and salts are `0600`. The list ID, full source references and reminder mappings are
+never committed to Git and are not printed in logs. If permissions, ownership, symlinks,
+extended ACLs, schema or hashes are unsafe, the operation fails closed.
 
 ## Data it does not send
 
-The application contains no HTTP client, analytics SDK, telemetry, advertising,
-crash-reporting service or hosted backend. It does not upload task titles,
-Vault paths, reminder contents or source files to this repository or to a
-third-party service.
+The project has no HTTP client, hosted backend, analytics SDK, telemetry, advertising or
+crash-reporting service. It does not upload task titles, notes, Vault paths, source files,
+personal profiles or list IDs. Apple may sync reminders through iCloud according to the user's
+Apple account and macOS settings; that is performed by Apple, not this project.
 
-Apple Reminders may sync through iCloud according to the user's Apple account
-and system settings. That synchronization is performed by macOS, not by this
-project.
+The tool does not use Computer Use and does not request Calendar, Contacts, Photos, microphone,
+camera or location access.
 
-## Pruning logs
+## Reminder notes
 
-Pruning output is limited to aggregate candidate, waiting, deletion,
-restoration and failure counts; when item correlation is needed it uses a
-truncated hash derived with the local random salt. Pruning logs do not contain
-reminder titles or notes, Vault or source-file paths, raw TaskForge IDs or raw
-EventKit IDs. Errors are reported by category without user content.
+Managed reminder notes contain only a stable TaskForge tool marker and a short source marker.
+The marker is intended for management, not secrecy. Full source references, previous status,
+source hashes and EventKit mappings remain in the private `0600` index rather than being copied
+into reminder notes.
 
-An EventKit reminder fetch is scoped to the configured list and cancelled after
-30 seconds. Timeout, permission, snapshot, source-resolution and I/O failures
-are treated as indeterminate and preserve the reminder.
+## Logs and recovery
 
-## Metadata stored in reminders
+Logs contain status counts, timing and anonymous error categories. They do not contain raw task
+IDs, EventKit IDs, titles, notes, list IDs, Vault paths or source paths. Backups are intentionally
+sensitive local data because they can contain the fields required to restore a source or
+reminder; stop the watcher before manual recovery and preserve their permissions.
 
-Linked reminders contain:
-
-- a stable, Base64-encoded TaskForge marker;
-- a Base64-encoded source reference used for historical reverse completion;
-- a human-readable source type, file path and line number.
-
-Anyone who can read the reminder can therefore see its title and source path.
-Use a dedicated reminder list and an Apple account you trust.
-
-## Permissions
-
-- **Reminders full access** is required to create, update and observe reminders.
-- **Full Disk Access** may be required by macOS to read TaskForge's sandbox
-  container or a protected Vault location.
-
-The tool does not request Calendar, Contacts, Photos, microphone, camera or
-location access.
-
-## Public repository hygiene
-
-Generated build directories, TaskForge cache files, logs, backups, `.env`
-files and local plist overrides are excluded by `.gitignore`. Contributors
-should still inspect staged files before every push. `PruneCandidates.json`,
-`PruneBackups/`, `PruneHashSalt`, `PruneHashSalt.lock` and
-`*.prune-test.json` are explicitly ignored in case private debugging data is
-copied into a checkout.
-
-Never commit reminder titles, notes, Vault or source paths, raw TaskForge /
-EventKit identifiers, candidate ledgers, pruning backups, salts or production
-logs. Uninstalling the App intentionally preserves these private files so that
-recovery remains possible; review and remove them separately only after any
-needed `--restore-last-prune` operation.
+Reverse completion changes a source task to `done` and never deletes a TaskForge task. Cleanup
+deletes only a managed, low-priority, unfinished reminder after the two-scan gate and verified
+backup; ordinary Apple reminders and all TaskForge source tasks are protected.

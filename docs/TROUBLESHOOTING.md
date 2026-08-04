@@ -1,197 +1,117 @@
 # Troubleshooting
 
+## Start with a read-only custom-list preview
+
+```bash
+APP=./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync
+"$APP" --check-config --taskforge-list-id LIST_ID
+"$APP" --dry-run --taskforge-list-id LIST_ID
+```
+
+The preview reads TaskForge only. It must report the same dynamic member count as the current
+TaskForge Today list before any command that requests Reminders permission. A missing list ID,
+missing `flutter.ctl_<id>`, malformed JSON, unknown filter field/operator, or malformed v6 store
+is a fail-closed configuration error.
+
+Once accepted, configure once with `--sync --taskforge-list-id LIST_ID`; later runs can omit the
+ID and read the private `0600` configuration. Never place a real ID in shell history shared with
+others, logs, tests or repository files.
+
 ## Permission denied
 
-Open:
+Open `System Settings → Privacy & Security → Reminders` and grant full access to the built App.
+The TaskForge container or Vault may additionally require Full Disk Access. Rebuilt ad hoc-signed
+Apps can receive a new TCC identity and may need re-authorization. The project never resets TCC
+or approves permissions automatically.
 
-`System Settings → Privacy & Security → Reminders`
+## A list or reminder is missing
 
-Enable **TaskForge Reminder Sync**. If the TaskForge cache or Vault cannot be
-read, also check **Full Disk Access**.
+Check the source first:
 
-If a manual `--sync` works but the LaunchAgent does not write a startup log,
-re-run `./scripts/install-daily-sync.sh`. Current releases start the bundle
-through LaunchServices so the background process retains the same Reminders
-permission identity as the app.
+```bash
+"$APP" --dry-run
+```
 
-Locally rebuilt ad hoc-signed apps receive a version-specific code identity.
-After rebuilding, re-authorize the newly installed app. To preserve identity
-across builds, use a stable code-signing certificate via
-`TASKFORGE_SYNC_CODESIGN_IDENTITY`; the project never creates one automatically.
+Confirm the task is a member of the fixed custom Kanban list, not terminal, and that its status
+is a known or displayable active status. A status list is created only when needed. If the old
+`TaskForge 今日` list exists, it is renamed in place to `TaskForge · 待办`.
 
-Pruning also needs private local state under:
+If a managed reminder was moved to a normal Apple list, the next reverse pass moves it back. A
+normal reminder without the marker/index is never imported or modified.
 
-`~/Library/Application Support/TaskForgeReminderSync/`
+## Apple completion is not reflected in TaskForge
 
-The directory must be accessible only to the current user (`0700`), while
-`PruneCandidates.json`, source backup files, files below `PruneBackups/` and
-`PruneHashSalt` must be `0600`. A normal mutating run may safely tighten an old
-user-owned `0755` runtime root and the known `Backups/` tree when every node is
-real, has no extended ACL and is not group/world writable. A symlink, different
-owner, ACL, group/world-writable mode, damaged ledger or checksum failure stays
-fail-closed and preserves the reminder.
+1. Keep TaskForge running so it can re-index the source.
+2. Run `--reverse-dry-run --task-id TEST_TASK_ID`.
+3. Check that the reminder still has the tool marker and is a managed task.
+4. Check the source is inside the current Vault and has not changed at the expected line.
+5. Confirm the source type is Markdown inline or TaskNotes and that symbol learning is not conflicting.
 
-## LaunchAgent is not running
+An unknown or conflicting symbol intentionally refuses the source write and moves the reminder
+back. Completion writes `done`; it never deletes the source task.
+
+## Open-state move was rejected
+
+The source status must be learned from real records. Current Markdown writeback symbols are
+`[ ]`, `[>]`, `[/]` and `[x]`. A symbol not learned for the target status, a symbol conflict,
+stale original line, ambiguous match, non-UTF-8 source, or Vault escape is a deliberate stop.
+TaskForge wins an open/open conflict; Apple completion wins an open/completed conflict.
+
+## TaskForge list was deleted or changed
+
+Stop the watcher. Restore or recreate the original fixed list without silently choosing a new
+ID, then run the anonymous preview again. A renamed list keeps its ID; a deleted or missing ID
+stops synchronization rather than falling back to a date query.
+
+## Prune candidate is not deleted
+
+Use the strict read-only classification:
+
+```bash
+"$APP" --prune-dry-run
+```
+
+Retention is expected when the reminder is completed, important, priority-bearing, in an
+ordinary list, still present in the current snapshot, source-confirmed by the private index,
+indeterminate due to I/O/permissions/ambiguity, or has not passed two unchanged scans separated
+by at least 60 seconds. A move, edit, completion or source reappearance restarts the gate.
+
+`--prune-dry-run` never creates or changes the ledger, backup directory, salt or reminders. A
+normal mutating pass may tighten a safe user-owned private root to `0700`; an exposed symlink,
+wrong owner, ACL or damaged state remains fail-closed.
+
+## EventKit reading times out
+
+Kanban fetches and prune fetches have a 30-second limit. The request is cancelled once and the
+pass fails closed; a late callback is ignored. Check Reminders permission and retry only after
+Reminders is responsive. A timeout must never be treated as an empty list.
+
+## Roll back a cleanup or source write
+
+Stop the watcher first. Use `--restore-last-prune` for the newest verified reminder deletion
+batch. Source-file backups are below:
+
+```text
+~/Library/Application Support/TaskForgeReminderSync/Backups/
+```
+
+Compare hashes before restoring. Keep the private index and backups until TaskForge re-reads the
+source and a fresh `--dry-run`/`--prune-dry-run` passes.
+
+## Watcher and LaunchAgent
 
 ```bash
 launchctl print "gui/$(id -u)/local.codex.taskforge-reminder-sync"
 tail -n 100 ~/Library/Logs/TaskForgeReminderSync.error.log
 ```
 
-Reinstall:
+Verify the private list ID exists before reinstalling. The watcher should be left running for at
+least 61 seconds during acceptance so both the event path and the full-scan fallback are observed.
+To reinstall:
 
 ```bash
 ./scripts/uninstall-daily-sync.sh
 ./scripts/install-daily-sync.sh
 ```
 
-## A reminder is not created
-
-Run:
-
-```bash
-./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
-  --check-config
-./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
-  --dry-run
-```
-
-Confirm the task is scheduled for today and is not already done or cancelled.
-
-## A TaskForge edit reports a deduplication conflict
-
-The forward log includes `冲突 N`. A conflict means more than one TaskForge
-record or managed reminder carries the same ID/source identity. The tool does
-not select one arbitrarily and does not create another reminder.
-
-1. Stop editing the affected task briefly and let TaskForge finish re-indexing.
-2. Run `--sync` again and confirm the conflict settles to `0`.
-3. If it remains, inspect only redacted reminder metadata and source locations.
-4. Do not delete reminders automatically; decide which existing item is
-   authoritative before manual cleanup.
-
-## Apple completion is not reflected in TaskForge
-
-1. Keep TaskForge running.
-2. Check the standard and error logs.
-3. Confirm the reminder was created by this tool and still contains its marker.
-4. Confirm the source remains inside the current Vault.
-5. Confirm the task is non-recurring and uses `onCompletion=keep`.
-
-Use `--reverse-dry-run --task-id TASK_ID` before any manual retry.
-
-Reverse sync only marks the TaskForge source task `done`; reminder pruning
-never deletes TaskForge task lines or TaskNotes files.
-
-## A prune candidate is not deleted
-
-Run the strict read-only classification first:
-
-```bash
-./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
-  --prune-dry-run
-```
-
-Common safe reasons for retaining a reminder are:
-
-- it is completed, has EventKit priority greater than zero, or starts with
-  `!`, `！`, `❗`, `‼️`, `⭐` or `📌` after leading whitespace;
-- the TaskForge current snapshot still contains it;
-- its durable source reference still resolves to a real Vault task;
-- source presence is indeterminate because of permissions, I/O, an out-of-Vault
-  path or an ambiguous same-named source task;
-- the second unchanged scan has not occurred at least 60 seconds later;
-- the reminder changed, moved lists or regained TaskForge identity, which
-  revokes or restarts the candidate;
-- it was restored less than 24 hours ago;
-- the candidate ledger or deletion backup cannot be privately written and
-  verified.
-
-`--prune-dry-run` is strictly read-only: it does not create or change the
-candidate ledger, backup directory, hash salt or reminders. To advance state,
-use `--prune-once`, `--sync`, or let `--watch` complete another reconciliation.
-This also means dry-run never fixes an old `0755` runtime root: it reports an
-anonymous permission failure until a normal mutating run safely migrates it.
-`PruneHashSalt` is lazy state and may still be absent after a successful first
-candidate-registration pass; it is not an installation-health check by itself.
-
-## Pruning reports an ambiguous list
-
-If more than one Apple Reminders list has the configured name, pruning and
-name-based restoration refuse to select one. Rename the unintended duplicate,
-then rerun `--prune-dry-run`. Do not delete either list until you have checked
-which one contains the expected reminders and backups.
-
-Pruning never fetches reminder contents from other lists. If the configured
-list does not exist, a prune pass returns zero and does not create it.
-
-## Reminder reading times out
-
-Each target-list EventKit fetch has a 30-second limit. On timeout, the tool
-cancels that fetch request once, records an anonymous error category and skips
-deletion. Check Reminders permission and whether the Reminders app is
-responsive, then retry. A late callback from the cancelled request is ignored.
-
-## Restore the last pruned batch
-
-Run:
-
-```bash
-./dist/TaskForgeReminderSync.app/Contents/MacOS/TaskForgeReminderSync \
-  --restore-last-prune
-```
-
-The command restores the newest verified, un-restored batch whose parsed actual
-deletion result is non-empty. Newer unresolved or zero-deletion backups remain
-available for audit but do not block an older real deletion batch and are not
-marked restored. It restores user-editable fields, but macOS assigns new
-EventKit IDs. Restored reminders receive a 24-hour minimum grace period and
-must complete two new scans before any later deletion.
-
-If the original list is gone, the tool attempts to recreate it only in the
-original reminders account recorded by the backup. A missing account, multiple
-same-named lists in that account, unsupported or modified backup, or ambiguous
-post-restore readback fails closed; the backup remains available for retry.
-The command is idempotent after an interrupted restore and will not knowingly
-duplicate an already read-back restored item.
-
-If no eligible non-empty unrestored batch is found, the restored count is zero.
-Unresolved, empty and restored backups remain at:
-
-`~/Library/Application Support/TaskForgeReminderSync/PruneBackups/`
-
-## Restore a source file
-
-Backups are stored below:
-
-`~/Library/Application Support/TaskForgeReminderSync/Backups/`
-
-Each run uses a private `0700` timestamped/unique directory and writes `0600`
-files. Compare the backup and current source before restoring. Stop the
-LaunchAgent first if manual restoration is needed.
-
-This source-file backup is separate from `PruneBackups/`, which restores Apple
-reminders deleted by the pruning feature.
-
-## Repeated sync loop
-
-Current versions compare EventKit date components semantically and should
-settle at `更新 0`. If logs show continuous updates:
-
-1. stop the LaunchAgent;
-2. save the relevant redacted logs;
-3. report the macOS and TaskForge versions;
-4. do not publish real reminder notes or Vault paths.
-
-## Uninstall and private pruning data
-
-```bash
-./scripts/uninstall-daily-sync.sh
-```
-
-Uninstalling stops the LaunchAgent and removes the installed App. It does not
-delete Apple reminders, Vault sources, the candidate ledger, pruning backups,
-hash salt or logs. If you may need a deleted reminder, run
-`--restore-last-prune` before removing those private runtime files. If the App
-is already uninstalled, rebuild it and run the restore command from `dist`;
-the preserved backup remains the source of truth.
+The installer does not delete reminders, TaskForge sources, private indexes or backups.
