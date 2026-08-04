@@ -3,6 +3,7 @@ import Darwin
 import EventKit
 import Foundation
 import TaskForgeReminderCore
+import TaskForgeReminderEventKit
 
 struct SyncConfiguration {
     var listName: String
@@ -25,6 +26,9 @@ enum SyncError: Error, LocalizedError {
     case backupFailed(String)
     case writeVerificationFailed(String)
     case taskForgeVerificationTimedOut(String)
+    case reminderFetchFailed
+    case invalidSource(String)
+    case legacyOptionRequiresScheduledDay(String)
 
     var errorDescription: String? {
         switch self {
@@ -52,6 +56,12 @@ enum SyncError: Error, LocalizedError {
             return "写入后内容校验失败：\(path)"
         case let .taskForgeVerificationTimedOut(title):
             return "源文件已写入，但等待 TaskForge 确认完成超时：\(title)"
+        case .reminderFetchFailed:
+            return "提醒事项读取超时或失败，已按失败关闭。"
+        case let .invalidSource(value):
+            return "同步源必须是 custom-list 或 scheduled-day：\(value)"
+        case let .legacyOptionRequiresScheduledDay(value):
+            return "参数 \(value) 仅能在 --source scheduled-day 兼容模式使用。"
         }
     }
 }
@@ -122,15 +132,26 @@ enum TaskSourceWriter {
             throw SyncError.sourceEncodingInvalid(sourceURL.path)
         }
 
-        let backupDirectory = try makeBackupDirectory(root: backupRoot)
         let safeName = sourceURL.lastPathComponent.replacingOccurrences(of: "/", with: "_")
-        let backupURL = backupDirectory.appendingPathComponent(
-            "\(task.identifier)-\(safeName).bak"
-        )
+        let safeIdentifier = task.identifier.map { character in
+            character.isLetter || character.isNumber
+                || character == "-" || character == "_"
+                ? character
+                : "_"
+        }
+        let backupURL: URL
         do {
-            try originalData.write(to: backupURL, options: [.atomic])
+            backupURL = try TaskSourceBackupStore(
+                backupsRootURL: URL(
+                    fileURLWithPath: backupRoot,
+                    isDirectory: true
+                )
+            ).save(
+                originalData,
+                fileName: "\(String(safeIdentifier))-\(safeName).bak"
+            )
         } catch {
-            throw SyncError.backupFailed(backupURL.path)
+            throw SyncError.backupFailed(backupRoot)
         }
 
         try updatedData.write(to: sourceURL, options: [.atomic])
@@ -149,20 +170,6 @@ enum TaskSourceWriter {
         )
     }
 
-    private static func makeBackupDirectory(root: String) throws -> URL {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .autoupdatingCurrent
-        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
-        let directory = URL(fileURLWithPath: root, isDirectory: true)
-            .appendingPathComponent(formatter.string(from: Date()), isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
-        )
-        return directory
-    }
-
     private static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
@@ -172,15 +179,36 @@ enum TaskSourceWriter {
 final class SyncEngine {
     private let configuration: SyncConfiguration
     private var calendar: Calendar
-    private let store = EKEventStore()
+    private let store: EKEventStore
+    private let pruner: ReminderPruner
     private var reminderObserver: NSObjectProtocol?
     private var reminderDebounceTask: Task<Void, Never>?
     private var isReconciling = false
     private var needsAnotherPass = false
 
     init(configuration: SyncConfiguration, calendar: Calendar) {
+        let store = EKEventStore()
         self.configuration = configuration
         self.calendar = calendar
+        self.store = store
+        self.pruner = ReminderPruner(
+            eventStore: store,
+            configuration: ReminderPruneConfiguration(
+                listName: configuration.listName,
+                localRoot: ReminderPruneLocalStore.defaultRoot,
+                confirmationInterval: 60,
+                restoreGraceInterval: 86_400
+            ),
+            log: { message in
+                print("[\(ISO8601DateFormatter().string(from: Date()))] \(message)")
+            },
+            logError: { message in
+                fputs(
+                    "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n",
+                    stderr
+                )
+            }
+        )
     }
 
     deinit {
@@ -556,6 +584,17 @@ final class SyncEngine {
         return counts
     }
 
+    func prune(dryRun: Bool) async throws -> ReminderPruneCounts {
+        let snapshot = try loadSnapshotWithRetry()
+        return dryRun
+            ? try await pruner.dryRun(snapshot: snapshot)
+            : try await pruner.advance(snapshot: snapshot)
+    }
+
+    func restoreLastPrune() async throws -> ReminderPruneCounts {
+        try await pruner.restoreLast()
+    }
+
     func reconcile(reason: String) async {
         if isReconciling {
             needsAnotherPass = true
@@ -578,6 +617,12 @@ final class SyncEngine {
                         + "跳过 \(reverseCounts.skipped)，失败 \(reverseCounts.failed)"
                 )
                 _ = try await forward()
+                let pruneCounts = try await prune(dryRun: false)
+                log(
+                    "清理同步：首次 \(pruneCounts.firstSeen)，"
+                        + "等待 \(pruneCounts.waiting)，删除 \(pruneCounts.deleted)，"
+                        + "失败 \(pruneCounts.failed)"
+                )
             } catch {
                 logError("双向同步失败：\(error.localizedDescription)")
             }

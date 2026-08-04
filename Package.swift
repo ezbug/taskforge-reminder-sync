@@ -21,14 +21,37 @@ let package = Package(
         .target(
             name: "TaskForgeReminderCore"
         ),
-        .executableTarget(
-            name: "TaskForgeReminderSync",
+        .target(
+            name: "TaskForgeReminderEventKit",
             dependencies: ["TaskForgeReminderCore"]
         ),
         .executableTarget(
+            name: "TaskForgeReminderSync",
+            dependencies: [
+                "TaskForgeReminderCore",
+                "TaskForgeReminderEventKit"
+            ]
+        ),
+        .executableTarget(
             name: "TaskForgeReminderCoreTests",
-            dependencies: ["TaskForgeReminderCore"],
+            dependencies: [
+                "TaskForgeReminderCore",
+                "TaskForgeReminderEventKit"
+            ],
             path: "Tests/TaskForgeReminderCoreTests"
+        ),
+        .executableTarget(
+            name: "TaskForgeReminderCLITests",
+            dependencies: ["TaskForgeReminderSync"],
+            path: "Tests/TaskForgeReminderCLITests"
+        ),
+        .executableTarget(
+            name: "TaskForgeReminderEventKitTests",
+            dependencies: [
+                "TaskForgeReminderCore",
+                "TaskForgeReminderEventKit"
+            ],
+            path: "Tests/TaskForgeReminderEventKitTests"
         )
     ]
 )

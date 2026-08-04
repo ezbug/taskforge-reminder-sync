@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Added automatic cleanup for unfinished, unimportant reminders that are
+  confirmed absent from both the TaskForge snapshot and durable Vault source.
+- Added protection for completed reminders, EventKit priority and six leading
+  important-title markers.
+- Added an unchanged two-scan confirmation window of at least 60 seconds,
+  private candidate persistence and fail-closed source resolution.
+- Added checksummed `0600` pre-deletion backups and
+  `--restore-last-prune` with a minimum 24-hour restoration grace period.
+- Restore selection skips unresolved, zero-deletion and already restored
+  backups, choosing the newest remaining real deletion batch.
+- Added strict read-only `--prune-dry-run` and one-pass `--prune-once`
+  commands; `--sync` and `--watch` now advance the same pruning state machine
+  after reverse and forward synchronization.
+- Scoped pruning fetches to exactly one configured reminders list, rejecting
+  same-name ambiguity and leaving all other lists untouched.
+- Added a 30-second EventKit fetch timeout with request cancellation and
+  anonymous, salted pruning logs.
+- Preserved the existing TaskForge boundary: reverse completion only marks
+  source tasks `done`; pruning never deletes TaskForge task lines or files.
+
 ## 1.1.0 - 2026-07-29
 
 - Added TaskForge-to-Reminders updates for linked title, date, time and status

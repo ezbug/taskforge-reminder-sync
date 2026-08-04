@@ -9,7 +9,8 @@ TASKFORGE_SYNC_SIGNING_IDENTITY=${TASKFORGE_SYNC_CODESIGN_IDENTITY:--}
 
 swift build \
   --package-path "$PROJECT_ROOT" \
-  --configuration release
+  --configuration release \
+  --product TaskForgeReminderSync
 
 BIN_DIR=$(swift build \
   --package-path "$PROJECT_ROOT" \

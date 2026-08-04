@@ -13,3 +13,10 @@ __pycache__/
 .env
 .env.*
 Backups/
+PruneCandidates.json
+PruneBackups/
+PruneHashSalt
+PruneHashSalt.lock
+*.prune-test.json
+.worktrees/
+.superpowers/

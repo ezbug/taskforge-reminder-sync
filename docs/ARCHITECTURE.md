@@ -4,104 +4,121 @@
 
 ### TaskForgeReminderCore
 
-A Foundation-only library responsible for:
+Core is pure Foundation policy and private persistence. It is responsible for:
 
-- decoding TaskForge MessagePack v6 records;
-- selecting scheduled open tasks;
-- creating and decoding stable markers;
-- deriving stable source identities and selecting deduplicated reminder matches;
-- serializing durable source references;
-- comparing reminder dates semantically;
-- validating and editing Markdown / TaskNotes completion state.
+- strict decoding of TaskForge v6 records, including the live scalar tombstone;
+- decoding `flutter.ctl_<listID>` from the TaskForge preferences plist;
+- validating known fields/operators and evaluating nested `all`/`any` filter groups;
+- canonicalizing TaskForge statuses and learning the four approved Markdown symbols;
+- editing Markdown/TaskNotes source content only after identity and original-line checks;
+- storing the private Kanban configuration/index with `0700`/`0600` verification;
+- the existing pruning, backup, restore and source-presence policies.
 
-Keeping these rules outside EventKit makes them deterministic and testable.
+Unknown filter schema, malformed private state and unknown status symbols are errors, not empty
+matches. This keeps an incomplete TaskForge reverse-engineering result from becoming a broad
+destructive query.
 
 ### TaskForgeReminderSync
 
-The macOS executable coordinates:
+The executable owns `EKEventStore`, calendar/list creation, forward and reverse reconciliation,
+source backups, TaskForge readback verification, and the near-real-time watcher. Its custom
+source path never writes `tasks.v6.bin`; it writes only the Vault source file and lets TaskForge
+re-index it.
 
-- `EKEventStore` access;
-- forward and reverse reconciliation;
-- source backups and SHA-256 receipts;
-- TaskForge cache refresh verification;
-- EventKit notifications, polling and scheduled fallbacks.
-
-The `--audit` path reads every managed reminder in the target list and
-separately reports duplicate task identifiers, duplicate active source
-identities, duplicate completed occurrences, normal historical source reuse and
-missing source identities. It emits aggregate counts only, including for
-historical reminders no longer present in the current TaskForge cache.
-
-The explicit deduplication path builds connected duplicate groups from active
-reminders that share either a TaskForge ID or a source identity. It preserves a
-single canonical reminder, preferring an ID still present in the current cache
-and otherwise the oldest item. Every redundant reminder is moved—not
-deleted—to a separate archive calendar before forward reconciliation refreshes
-the preserved item.
+The old scheduled-day engine remains behind `--source scheduled-day` for compatibility. It is
+not used by the default custom-list path.
 
 ### LaunchAgent
 
-The installed LaunchAgent keeps a small signed supervisor alive. The supervisor
-starts the app through LaunchServices, monitors the exact `--watch` process and
-terminates it when the LaunchAgent is unloaded. Launching the bundle, rather
-than its inner Mach-O directly, preserves the EventKit/TCC app identity in the
-background. The watcher:
+The supervisor starts the signed App bundle so the background process has the same Reminders TCC
+identity as a manually launched App. It restarts the watcher if it exits. The watcher:
 
-1. reconciles at startup;
-2. debounces `EKEventStoreChanged` notifications for 750 ms;
-3. checks the TaskForge cache mtime every second;
-4. runs a full reconciliation every minute;
-5. runs additional checks at 07:00, 11:00 and 15:00.
+1. reconciles once at startup;
+2. debounces `EKEventStoreChanged` for 750 ms;
+3. checks the task store and preferences plist every second;
+4. performs a full pass every 60 seconds;
+5. performs extra passes at 07:00, 11:00 and 15:00.
 
-## Forward flow
+Each pass is serialized. Its order is reverse conflict resolution, forward status reconciliation,
+then the protected two-scan cleanup. A TaskForge source change is re-read before the forward
+phase when reverse writing occurred in the same pass.
 
-1. Decode `tasks.v6.bin`.
-2. Select tasks scheduled today and not completed/cancelled.
-3. Find or create the configured reminder list.
-4. Match reminders by a stable marker derived from Vault path and task ID.
-5. If the ID changed, fall back to a durable source identity:
-   - inline Markdown: standardized file path and line number;
-   - TaskNotes: standardized file path.
-6. Prefer an uncompleted reminder at that source. A completed reminder also
-   needs the same scheduled day, so an older task that reused the line cannot
-   capture a new occurrence.
-7. Reject ambiguous ID/source/occurrence matches instead of creating another
-   reminder.
-8. Create/update title, due date, notes, marker and durable source reference.
-9. Preserve completion if either side is already completed.
+## Custom-list forward flow
 
-Only today's open tasks create new reminders. Existing linked reminders may
-still be refreshed so title, date, time, completion and durable source mapping
-stay current. A source-identity fallback rewrites the old marker on the same
-EventKit item, so a TaskForge reindex does not create a second reminder.
+1. Read `tasks.v6.bin`; a truncated or unknown record fails the pass closed.
+2. Read the fixed private list ID and the matching `flutter.ctl_<listID>` JSON.
+3. Validate and evaluate TaskForge's group and condition logic against all v6 tasks.
+4. Learn only non-conflicting symbols from real source records and persist them privately.
+5. Find or create only the state lists needed by current statuses. Reuse/rename the legacy
+   `TaskForge 今日` list as `TaskForge · 待办`.
+6. Match managed reminders by the stable marker or private index. Duplicate candidates are a
+   conflict and never cause a new reminder.
+7. Move the reminder to the canonical status list, update title, original scheduled date/time,
+   priority and concise marker notes, and preserve completion.
+8. Completed/cancelled tasks are completed in EventKit and are not put in an active state list.
+9. Managed reminders whose source task left the fixed list are moved to the base `待办` list
+   so the protected prune state machine can classify low-priority absent items.
 
-## Reverse flow
+No date filter is added by this path. An existing task's original schedule is the only date
+information sent to EventKit.
 
-1. Fetch all reminders from the configured list, including completed history.
-2. Keep only completed reminders carrying this tool's marker.
-3. Resolve the task from the current TaskForge cache or the durable reminder
-   source reference.
-4. Reject recurring, non-`keep`, out-of-Vault or ambiguous tasks.
-5. Detect and skip a source that is already completed.
-6. Back up the complete source file.
-7. Apply the completion edit atomically.
-8. Verify exact file bytes and wait for TaskForge's cache to refresh.
+## Reverse flow and conflict precedence
+
+All state lists are read for managed reminders, including completed reminders. For an open task,
+the previous private index status distinguishes a TaskForge change from an Apple list move:
+
+| Situation | Decision |
+|---|---|
+| TaskForge open status changed | TaskForge wins; forward phase moves Apple reminder |
+| Apple open list changed only | Write that approved status to source, then verify readback |
+| Both open sides changed | TaskForge wins; Apple reminder is moved back |
+| Apple completion is newly observed | Apple completion wins; source becomes `done` |
+| Apple reminder was moved to an ordinary list | Move it back to current TaskForge state |
+| Symbol unknown/conflicting or source stale | Refuse source write and move reminder back |
+
+Source write checks the resolved source path is inside the Vault, reads the exact original bytes,
+backs them up, applies only the status edit, atomically replaces the file, hashes and reads it
+back, then waits up to 15 seconds for TaskForge to expose the target state. A completion never
+deletes a TaskForge line or file.
+
+## State list policy
+
+Known active states map to the names and colors documented in the README. Unknown active states
+use the configured prefix and a gray list; terminal states have no active list. Existing exact
+state-list duplicates are ambiguous and stop the pass. A normal Apple list is never treated as a
+status merely because its title resembles one.
+
+## Pruning and recovery
+
+The custom path scopes pruning to `TaskForge · 待办`. It protects completed, important,
+priority-bearing, indeterminate and ordinary reminders. An absent low-priority managed item is
+registered in a private ledger, re-fetched after at least 60 seconds, backed up, removed, and
+verified. Fetches time out after 30 seconds; timeout, permission, source and I/O errors preserve
+the reminder. Other Apple lists are never fetched as prune inputs.
+
+Source references used for historical presence checks are stored in the private index, not in
+reminder notes. The private index is passed into the pruning policy so historical managed items
+remain protected without exposing full paths in EventKit notes.
+
+All deletion and source-write backups are private, checksum-verified and recoverable. Restore
+never consumes a backup when account, calendar, schema, checksum or readback is ambiguous.
+
+The custom deduplication command builds duplicate groups from all active marked reminders using
+the private source references, moves confirmed extras to `TaskForge 今日 · 去重归档`, marks those
+extras complete, and adds an archive marker that excludes them from reverse completion. It never
+deletes the reminder or its TaskForge source.
 
 ## Why the binary cache is read-only
 
-`tasks.v6.bin` is treated as an implementation detail and cache, not as a
-public database. Writing it could race with TaskForge, corrupt the cache or
-bypass TaskForge's own source-of-truth rules. Reverse sync therefore changes
-the Vault source and lets TaskForge re-index it.
+`tasks.v6.bin` is a TaskForge cache and implementation detail. Writing it could race with
+TaskForge or bypass the source-of-truth rules. Reverse sync changes the Markdown/TaskNotes
+source, then waits for TaskForge to re-index it.
 
-## Loop prevention
+## Loop prevention and safety gates
 
-- Apple completion is monotonic: forward sync never reopens an already
-  completed reminder.
-- Date components are compared by year/month/day/hour/minute, ignoring
-  EventKit's calendar/time-zone metadata.
-- EventKit changes are debounced.
-- A second reconciliation is queued instead of running concurrently.
-- A reminder is claimed by at most one TaskForge task in each reconciliation.
-- Duplicate IDs, duplicate source identities and ambiguous existing reminders
-  are reported as conflicts and never cause a new reminder to be created.
+- EventKit notifications are debounced and passes cannot run concurrently.
+- A reminder is claimed by at most one source task per pass.
+- Completion is monotonic; forward sync never reopens an Apple-completed reminder.
+- Date comparisons use only year/month/day/hour/minute, not EventKit metadata.
+- Private configuration/index permission or schema failures stop writes.
+- No production permission request, write, cleanup or watcher acceptance is automated by tests.
