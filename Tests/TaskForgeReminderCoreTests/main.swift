@@ -689,9 +689,24 @@ private let tests: [TestCase] = [
             "status editor added an artificial completion date"
         )
     }),
+    ("TaskForge status symbol learning migrates planned aliases", {
+        let task = kanbanTask(
+            identifier: "planned-task",
+            status: "planned",
+            line: "- [>] planned-task"
+        )
+        let learned = try TaskForgeStatusSymbolLearner.learn(
+            tasks: [task],
+            existing: ["planned": "[>]"]
+        )
+        try require(
+            learned["scheduled"] == "[>]" && learned["planned"] == nil,
+            "planned symbol alias was not migrated to scheduled"
+        )
+    }),
     ("TaskForge status aliases cover every Kanban state", {
         let aliases = [
-            "todo", "scheduled", "ready", "inProgress", "on-hold",
+            "todo", "scheduled", "planned", "ready", "inProgress", "on-hold",
             "deferred", "blocked", "someday", "done", "cancelled"
         ]
         let expected = Set(TaskForgeKanbanStatus.allCases.map(\.rawValue))

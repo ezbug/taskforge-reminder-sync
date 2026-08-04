@@ -21,7 +21,7 @@ public enum TaskForgeKanbanStatus: String, Codable, CaseIterable, Sendable {
         switch normalized.lowercased() {
         case "todo", "open":
             return Self.todo.rawValue
-        case "scheduled":
+        case "scheduled", "planned":
             return Self.scheduled.rawValue
         case "ready":
             return Self.ready.rawValue
@@ -643,7 +643,19 @@ public enum TaskForgeStatusSymbolLearner {
         tasks: [TaskForgeTask],
         existing: [String: String] = [:]
     ) throws -> [String: String] {
-        var result = existing
+        var result: [String: String] = [:]
+        for (rawStatus, symbol) in existing {
+            let status = TaskForgeKanbanStatus.canonical(rawStatus)
+            if let previous = result[status], previous != symbol {
+                throw TaskForgeStatusSymbolError.conflict(status)
+            }
+            if let otherStatus = result.first(where: {
+                $0.value == symbol && $0.key != status
+            })?.key {
+                throw TaskForgeStatusSymbolError.conflict(otherStatus)
+            }
+            result[status] = symbol
+        }
         for task in tasks {
             guard task.sourceType?.lowercased() == "markdowninline",
                 let line = task.originalLine,
