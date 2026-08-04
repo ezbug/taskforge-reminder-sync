@@ -800,6 +800,10 @@ final class KanbanSyncEngine {
                     targetStatus = TaskForgeKanbanStatus.done.rawValue
                 } catch {
                     counts.reverseSkipped += 1
+                    logError(
+                        "反向写回拒绝：\(reverseFailureCategory(error))；"
+                            + "提醒已恢复到当前 TaskForge 状态。"
+                    )
                     try moveBack(
                         reminder: reminder,
                         status: currentStatus
@@ -839,6 +843,10 @@ final class KanbanSyncEngine {
                     counts.reverseWritten += 1
                 } catch {
                     counts.reverseSkipped += 1
+                    logError(
+                        "反向写回拒绝：\(reverseFailureCategory(error))；"
+                            + "提醒已恢复到当前 TaskForge 状态。"
+                    )
                     try moveBack(
                         reminder: reminder,
                         status: currentStatus
@@ -1251,5 +1259,21 @@ final class KanbanSyncEngine {
     private func modificationDate(at path: String) -> Date? {
         (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate]
             as? Date
+    }
+
+    private func reverseFailureCategory(_ error: Error) -> String {
+        switch error {
+        case is TaskForgeStatusSymbolError:
+            return "source-status-validation"
+        case is SyncError:
+            return "source-write-or-readback"
+        default:
+            return "unknown-write-failure"
+        }
+    }
+
+    private func logError(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        fputs("[\(timestamp)] \(message)\n", stderr)
     }
 }
